@@ -1,0 +1,44 @@
+# Data
+data/C3VD/
+!configs/data/
+
+# Experiments & outputs
+experiments/
+results/
+__pycache__/
+*.pyc
+*.pyo
+
+# Weights & wandb
+wandb/
+*.ckpt
+
+# Media
+*.png
+*.avi
+*.mp4
+*.npy
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Misc
+*.log
+*.tar.gz
+*.zip
+notes.txt
+playground.ipynb
+
+# Compiled CUDA
+*.so
+*.o
+build/
+dist/
+*.egg-info/
