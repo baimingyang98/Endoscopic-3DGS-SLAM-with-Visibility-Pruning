@@ -109,6 +109,14 @@ def main(rast_dir):
         ),
     ])
 
+    # 5b. rasterize_points.h header signature
+    patch_file(os.path.join(rast_dir, "rasterize_points.h"), [
+        (
+            'std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>\nRasterizeGaussiansCUDA',
+            'std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>\nRasterizeGaussiansCUDA'
+        ),
+    ])
+
     # 6. diff_gaussian_rasterization/__init__.py
     patch_file(os.path.join(rast_dir, "diff_gaussian_rasterization/__init__.py"), [
         # 6a. Unpack 8 values
