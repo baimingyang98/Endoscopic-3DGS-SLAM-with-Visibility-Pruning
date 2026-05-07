@@ -1,24 +1,14 @@
 """
-StereoMIS dataset loader for EndoGSLAM.
+StereoMIS dataset loader.
 
-StereoMIS is a stereo endoscopic surgery dataset from MICCAI 2023:
-Hayoz et al., "Pose Estimation and 3D Reconstruction of Vascular Structures
-from Endoscopic Stereo Video"
+Loads PREPROCESSED StereoMIS data (via scripts/preprocess_stereomis.py).
 
-Dataset: https://zenodo.org/records/7727692
-
-Expected directory structure (verify after download):
+Expected structure (after running preprocess_stereomis.py):
     basedir/sequence/
-        image_0/                  # left RGB frames (000000.png, 000001.png, ...)
-        depth/ or disparity/      # depth maps (or disparity, needs conversion)
-        groundtruth.txt           # camera poses (TUM format: timestamp tx ty tz qx qy qz qw)
-        calibration.yaml          # intrinsics + baseline
-
-NOTE: This loader is a TEMPLATE. You must verify and adjust:
-    1. The actual subfolder names after extraction
-    2. Pose file format (TUM vs KITTI vs custom)
-    3. Whether depth is provided directly or as disparity
-    4. The depth scale factor
+        color/000241.png        # rectified left RGB
+        depth/000241.tiff       # depth in mm (uint16)
+        pose.txt                # 4x4 poses, one per line, 16 comma-separated floats
+        intrinsics.yaml         # auto-generated rectified intrinsics
 """
 import glob
 import os
@@ -31,41 +21,14 @@ from natsort import natsorted
 from .basedataset import GradSLAMDataset
 
 
-def tum_pose_to_matrix(line):
-    """
-    Convert a TUM-format pose line (tx ty tz qx qy qz qw) to 4x4 matrix.
-    """
-    parts = line.strip().split()
-    if len(parts) == 8:
-        # timestamp tx ty tz qx qy qz qw
-        _, tx, ty, tz, qx, qy, qz, qw = map(float, parts)
-    elif len(parts) == 7:
-        tx, ty, tz, qx, qy, qz, qw = map(float, parts)
-    else:
-        raise ValueError(f"Unexpected pose format: {line}")
-
-    # Quaternion to rotation matrix (Hamilton convention)
-    n = qx*qx + qy*qy + qz*qz + qw*qw
-    s = 2.0 / n
-    R = np.array([
-        [1 - s*(qy*qy + qz*qz),  s*(qx*qy - qz*qw),    s*(qx*qz + qy*qw)],
-        [s*(qx*qy + qz*qw),      1 - s*(qx*qx + qz*qz), s*(qy*qz - qx*qw)],
-        [s*(qx*qz - qy*qw),      s*(qy*qz + qx*qw),    1 - s*(qx*qx + qy*qy)],
-    ])
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = [tx, ty, tz]
-    return T
-
-
 class StereoMISDataset(GradSLAMDataset):
     """
-    Dataset loader for StereoMIS.
-
+    Dataset loader for preprocessed StereoMIS sequences.
+    
     Args:
         config_dict: from configs/data/stereomis.yaml
-        basedir: root data directory (e.g., './data/StereoMIS')
-        sequence: sequence name (e.g., 'P1', 'P2')
+        basedir: e.g., './data/StereoMIS'
+        sequence: e.g., 'P1', 'P2_0', 'P3'
         train_or_test: 'train', 'test', or 'all'
     """
 
@@ -77,8 +40,8 @@ class StereoMISDataset(GradSLAMDataset):
         stride: Optional[int] = 1,
         start: Optional[int] = 0,
         end: Optional[int] = -1,
-        desired_height: Optional[int] = 540,
-        desired_width: Optional[int] = 675,
+        desired_height: Optional[int] = 512,
+        desired_width: Optional[int] = 640,
         load_embeddings: Optional[bool] = False,
         embedding_dir: Optional[str] = "embeddings",
         embedding_dim: Optional[int] = 512,
@@ -86,7 +49,7 @@ class StereoMISDataset(GradSLAMDataset):
         **kwargs,
     ):
         self.input_folder = os.path.join(basedir, sequence)
-        self.pose_path = os.path.join(self.input_folder, "groundtruth.txt")
+        self.pose_path = os.path.join(self.input_folder, "pose.txt")
         self.mode = train_or_test
         super().__init__(
             config_dict,
@@ -103,12 +66,8 @@ class StereoMISDataset(GradSLAMDataset):
 
     def get_filepaths(self):
         """Get sorted color/depth file paths."""
-        # ADJUST these paths based on actual StereoMIS structure
-        color_paths = natsorted(glob.glob(f"{self.input_folder}/image_0/*.png"))
-        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth/*.png"))
-        if not depth_paths:
-            depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth/*.tiff"))
-
+        color_paths = natsorted(glob.glob(f"{self.input_folder}/color/*.png"))
+        depth_paths = natsorted(glob.glob(f"{self.input_folder}/depth/*.tiff"))
         embedding_paths = None
         if self.load_embeddings:
             embedding_paths = natsorted(
@@ -117,24 +76,21 @@ class StereoMISDataset(GradSLAMDataset):
         return color_paths, depth_paths, embedding_paths
 
     def load_poses(self):
-        """Load ground-truth camera poses (TUM format assumed)."""
+        """
+        Load 4x4 poses from pose.txt (same format as C3VD: 16 comma-separated floats per line).
+        """
         poses = []
         with open(self.pose_path, "r") as f:
-            lines = [l for l in f.readlines() if not l.startswith("#")]
-
-        # Some StereoMIS sequences have one pose per frame; others are sparse.
-        # If sparse, you may need interpolation. For now, assume 1-to-1 matching.
+            lines = f.readlines()
         for i in range(self.num_imgs):
             line = lines[i]
-            T = tum_pose_to_matrix(line)
-            poses.append(torch.from_numpy(T).float())
+            pose = list(map(float, line.split(sep=",")))
+            pose = torch.Tensor(pose).reshape(4, 4).float()
+            poses.append(pose)
         return poses
 
     def train_test_split(self, stride):
-        """
-        Same convention as C3VD: every 8th frame is test.
-        Adjust this if StereoMIS has its own train/test split convention.
-        """
+        """Same convention as C3VD: every 8th frame is test."""
         all_idx = set(range(self.end))
         eval_idx = set(range(self.start + 7, self.end, 8))
         train_idx = all_idx - eval_idx
