@@ -1,0 +1,11 @@
+dataset_name: "stereomis"
+camera_params:
+  # PLACEHOLDER VALUES - update from StereoMIS calibration.yaml after download
+  image_height: 512
+  image_width: 640
+  fx: 569.7
+  fy: 569.7
+  cx: 320.0
+  cy: 256.0
+  png_depth_scale: 1000.0  # depth in mm -> meters; verify with actual data
+  crop_edge: 0

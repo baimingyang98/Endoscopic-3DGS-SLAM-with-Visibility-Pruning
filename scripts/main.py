@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from datasets.gradslam_datasets import load_dataset_config, EndoSLAMDataset, C3VDDataset
+from datasets.gradslam_datasets import load_dataset_config, EndoSLAMDataset, C3VDDataset, StereoMISDataset
 from utils.common_utils import seed_everything, save_params_ckpt, save_params, save_means3D
 from utils.eval_helpers import report_progress, eval_save
 from utils.keyframe_selection import keyframe_selection_overlap, keyframe_selection_distance
@@ -54,6 +54,8 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return EndoSLAMDataset(config_dict, basedir, sequence, **kwargs)
     elif name in ["c3vd"]:
         return C3VDDataset(config_dict, basedir, sequence, **kwargs)
+    elif name in ["stereomis"]:
+        return StereoMISDataset(config_dict, basedir, sequence, **kwargs)
     else:
         raise ValueError(f"Unknown dataset: {name}")
 
