@@ -35,8 +35,8 @@ except (KeyError, IndexError):
 # ============================================================
 map_every = 1
 keyframe_every = 8
-tracking_iters = 15
-mapping_iters = 25
+tracking_iters = 30
+mapping_iters = 50
 
 group_name = "C3VD_innovations"
 run_name = scene_name
