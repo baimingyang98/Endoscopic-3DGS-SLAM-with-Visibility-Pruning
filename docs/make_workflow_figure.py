@@ -202,6 +202,14 @@ def star_badge(ax, x, y, label, color="#D4A700"):
             fontsize=8.5, fontweight="bold", color="white", zorder=11)
 
 
+def step_circle(ax, x, y, num, size=0.18, color="#666"):
+    """Draw a small numbered circle for sequence steps (①②③)."""
+    ax.add_patch(plt.Circle((x, y), size, facecolor="white",
+                            edgecolor=color, linewidth=1.5, zorder=10))
+    ax.text(x, y, str(num), ha="center", va="center",
+            fontsize=10, fontweight="bold", color=color, zorder=11)
+
+
 # ============================================================
 # Main figure
 # ============================================================
@@ -210,7 +218,7 @@ def main():
         "rgb":      PIC_DIR / "215" / "215f_gt.png",
         "baseline": PIC_DIR / "215" / "215_bl.png",
         "ours":     PIC_DIR / "215" / "215_ours.png",
-        "depth":    PIC_DIR / "depth_est.png",
+        "depth":    PIC_DIR / "depth.png",
     }
     imgs = {}
     for k, p in paths.items():
@@ -247,8 +255,8 @@ def main():
 
     # ---- Input ----
     add_module(ax, 0.4, R1_Y, 3.4, R1_H, "RGB-D Input", "input")
-    add_image(ax, imgs["rgb"], 1.4, R1_Y + 1.85, zoom=0.24, label="RGB")
-    add_image(ax, imgs["depth_crop"], 2.85, R1_Y + 1.85, zoom=0.20, label="Depth")
+    add_image(ax, imgs["rgb"], 1.4, R1_Y + 1.85, zoom=0.33, label="RGB")
+    add_image(ax, imgs["depth_crop"], 2.85, R1_Y + 1.85, zoom=0.58, label="Depth")
     ax.text(2.1, R1_Y + 0.55, "Per-frame stream\n(C3VD / StereoMIS)",
             ha="center", va="center", fontsize=9.5, style="italic", color="#444")
 
@@ -259,7 +267,9 @@ def main():
                 fontsize=17, fontweight="bold", color="#444", zorder=5)
     add_arrow(ax, 5.05, R1_Y + 1.55, 5.45, R1_Y + 1.55, lw=1.8)
     gaussian_schematic(ax, 5.95, R1_Y + 1.55, n=5, scale=0.5)
-    ax.text(5.5, R1_Y + 2.4, "Frame 0 → seed Gaussians",
+    ax.text(5.5, R1_Y + 2.4, "Frame 0 → Initial Gaussians",
+            ha="center", va="center", fontsize=9.5, style="italic", color="#444")
+    ax.text(5.5, R1_Y + 2, "Camera Pose → Identity",
             ha="center", va="center", fontsize=9.5, style="italic", color="#444")
     ax.text(5.5, R1_Y + 0.55, "(point cloud back-projection)",
             ha="center", va="center", fontsize=9, color="#666")
@@ -274,7 +284,7 @@ def main():
     ax.text(8.95, R1_Y + 2.45, "$\\hat{\\mathcal{T}}_{t+1}$",
             ha="center", va="bottom", fontsize=12, fontweight="bold")
     snowflake(ax, 9.85, R1_Y + 2.15, size=0.20, color="#5BB3D6")
-    ax.text(9.85, R1_Y + 1.65, "frozen", ha="center", va="center",
+    ax.text(9.85, R1_Y + 1.65, "Gaussians frozen ", ha="center", va="center",
             fontsize=8.5, color="#444")
 
     ax.text(8.85, R1_Y + 1.05,
@@ -284,72 +294,95 @@ def main():
     ax.text(8.85, R1_Y + 0.45, "Camera params only",
             ha="center", va="center", fontsize=8.5, style="italic", color="#444")
 
-    # ---- Mapping (per-frame) ----
-    MAP_X, MAP_W = 10.8, 5.0
+    # ---- Mapping (per-frame) - widened to 6.0 with longer arrows ----
+    MAP_X, MAP_W = 10.8, 6.0
     add_module(ax, MAP_X, R1_Y, MAP_W, R1_H, "Mapping (per-frame)", "map")
 
-    sub_y = R1_Y + 1.85
+    sub_y = R1_Y + 1.75
 
-    # Add Gaussians indicator
-    ax.text(MAP_X + 0.55, sub_y + 0.35, "①", ha="center", va="center",
-            fontsize=13, fontweight="bold", color="#666")
-    ax.text(MAP_X + 0.55, sub_y - 0.05, "Add\nGaussians",
-            ha="center", va="center", fontsize=8, color="#444")
-    add_arrow(ax, MAP_X + 0.95, sub_y, MAP_X + 1.3, sub_y, lw=1.4)
+    # Step ①: Add Gaussians (small icon, no box)
+    step_circle(ax, MAP_X + 0.45, sub_y + 0.30, "1", size=0.18)
+    ax.text(MAP_X + 0.45, sub_y - 0.15, "Add\nGaussians",
+            ha="center", va="center", fontsize=8.5, color="#444")
+    add_arrow(ax, MAP_X + 0.75, sub_y, MAP_X + 1.4, sub_y, lw=1.6)
 
-    # Modified CUDA Rasterizer (highlighted)
+    # Step ②: Modified CUDA Rasterizer (highlighted as Innovation 1)
+    RAST_X, RAST_W = MAP_X + 1.4, 1.8
     rast_box = FancyBboxPatch(
-        (MAP_X + 1.3, sub_y - 0.4), 1.7, 0.85,
+        (RAST_X, sub_y - 0.40), RAST_W, 0.85,
         boxstyle="round,pad=0.02,rounding_size=0.08",
         linewidth=2.2, facecolor=COLORS["inno1"], edgecolor=BORDERS["inno1"],
         zorder=2,
     )
     ax.add_patch(rast_box)
-    ax.text(MAP_X + 2.15, sub_y + 0.15, "Modified",
-            ha="center", va="center", fontsize=9, fontweight="bold", color="#222")
-    ax.text(MAP_X + 2.15, sub_y - 0.18, "CUDA Rasterizer",
-            ha="center", va="center", fontsize=9, fontweight="bold", color="#222")
-    star_badge(ax, MAP_X + 1.4, sub_y + 0.5, "1")
+    # ax.text(RAST_X + RAST_W/2, sub_y + 0.13, "Modified",
+    #         ha="center", va="center", fontsize=9.5, fontweight="bold", color="#222")
+    ax.text(RAST_X + RAST_W/2, sub_y + 0.13, "CUDA Rasterizer",
+            ha="center", va="center", fontsize=9.5, fontweight="bold", color="#222")
+    ax.text(RAST_X + RAST_W/2, sub_y - 0.18, "Visibility Calculation",
+            ha="center", va="center", fontsize=9.5, fontweight="bold", color="#222")
+    step_circle(ax, RAST_X + 0.20, sub_y + 0.50, "2", size=0.18, color="#8B6F00")
 
-    add_arrow(ax, MAP_X + 3.0, sub_y, MAP_X + 3.3, sub_y, lw=1.4)
+    add_arrow(ax, RAST_X + RAST_W, sub_y, RAST_X + RAST_W + 0.65, sub_y, lw=1.6)
 
-    # Visibility-Aware Pruning (highlighted)
+    # Step ③: Visibility-Aware Pruning (highlighted as Innovation 1)
+    PRUNE_X, PRUNE_W = RAST_X + RAST_W + 0.65, 1.8
     prune_box = FancyBboxPatch(
-        (MAP_X + 3.3, sub_y - 0.4), 1.5, 0.85,
+        (PRUNE_X, sub_y - 0.40), PRUNE_W, 0.85,
         boxstyle="round,pad=0.02,rounding_size=0.08",
         linewidth=2.2, facecolor=COLORS["inno1"], edgecolor=BORDERS["inno1"],
         zorder=2,
     )
     ax.add_patch(prune_box)
-    ax.text(MAP_X + 4.05, sub_y + 0.15, "Visibility-",
-            ha="center", va="center", fontsize=9, fontweight="bold", color="#222")
-    ax.text(MAP_X + 4.05, sub_y - 0.18, "Aware Pruning",
-            ha="center", va="center", fontsize=9, fontweight="bold", color="#222")
-    star_badge(ax, MAP_X + 3.4, sub_y + 0.5, "1")
+    ax.text(PRUNE_X + PRUNE_W/2, sub_y + 0.13, "Visibility-Aware",
+            ha="center", va="center", fontsize=9.5, fontweight="bold", color="#222")
+    ax.text(PRUNE_X + PRUNE_W/2, sub_y - 0.18, "Pruning",
+            ha="center", va="center", fontsize=9.5, fontweight="bold", color="#222")
+    step_circle(ax, PRUNE_X + 0.20, sub_y + 0.50, "3", size=0.18, color="#8B6F00")
 
-    # V_i flow indicator
-    ax.text(MAP_X + 2.2, R1_Y + 0.6, r"per-Gaussian visibility $V_i$",
-            ha="center", va="center", fontsize=8.5, style="italic", color="#8B6F00",
+    # Innovation 1 banner spanning both highlighted blocks
+    banner_x = RAST_X - 0.05
+    banner_w = (PRUNE_X + PRUNE_W) - banner_x + 0.05
+    banner_y = sub_y + 0.95
+    banner = FancyBboxPatch(
+        (banner_x, banner_y - 0.20), banner_w, 0.36,
+        boxstyle="round,pad=0.02,rounding_size=0.06",
+        linewidth=1.5, facecolor="#FFF9E0", edgecolor=BORDERS["inno1"],
+        zorder=2,
+    )
+    # ax.add_patch(banner)
+    # ax.text(banner_x + banner_w/2, banner_y, "★ Innovation 1",
+    #         ha="center", va="center", fontsize=9.5, fontweight="bold",
+    #         color="#8B6F00", zorder=3)
+
+    # V_i flow indicator below the rasterizer block
+    ax.text(RAST_X + RAST_W/2, R1_Y + 0.55,
+            r"per-Gaussian visibility $V_i$",
+            ha="center", va="center", fontsize=9, style="italic", color="#8B6F00",
             bbox=dict(boxstyle="round,pad=0.15", facecolor="#FFF9E0",
                      edgecolor="#D4A700"))
-    ax.text(MAP_X + 4.0, R1_Y + 0.55, "backprop",
-            ha="center", va="center", fontsize=8.5, style="italic", color="#444")
+    ax.text(PRUNE_X + PRUNE_W/2, R1_Y + 0.55, "backprop $\\to$ update",
+            ha="center", va="center", fontsize=9, style="italic", color="#444")
 
-    # ---- Output ----
-    add_module(ax, 16.0, R1_Y, 3.6, R1_H, "Output", "out")
-    add_image(ax, imgs["ours"], 17.0, R1_Y + 1.95, zoom=0.16, label="Rendered")
-    camera_frustum(ax, 18.7, R1_Y + 2.1, size=0.22, color="#888")
-    ax.text(18.7, R1_Y + 1.65, "Trajectory", ha="center", va="center",
-            fontsize=9, color="#444")
-    ax.text(17.8, R1_Y + 0.5, "+ Gaussian map (.npz)\n+ Per-frame metrics",
+    # ---- Output ---- (shifted right because Mapping is wider)
+    add_module(ax, 17.0, R1_Y, 2.6, R1_H, "Output", "out")
+    add_image(ax, imgs["ours"], 17.85, R1_Y + 1.85, zoom=0.28, label="Rendered")
+    ax.text(18.3, R1_Y + 0.55,
+            "+Camera trajectory\n+ Gaussian map (.npz)\n+ Per-frame metrics",
             ha="center", va="center", fontsize=8.5, style="italic", color="#444")
 
     # =========================================================
-    # Pipeline arrows between top-row boxes
+    # Pipeline arrows between top-row boxes (longer/clearer)
     # =========================================================
     pipeline_y = R1_Y + R1_H / 2
-    for x_start in [3.8, 7.0, 10.6, 15.8]:
-        add_arrow(ax, x_start, pipeline_y, x_start + 0.2, pipeline_y, lw=2.4, color="#333")
+    pipeline_arrows = [
+        (3.8, 4.0),     # Input -> Init
+        (7.0, 7.2),     # Init -> Tracking
+        (10.6, 10.8),   # Tracking -> Mapping
+        (16.8, 17.0),   # Mapping -> Output (gap shifted)
+    ]
+    for x_start, x_end in pipeline_arrows:
+        add_arrow(ax, x_start, pipeline_y, x_end, pipeline_y, lw=2.4, color="#333")
 
     # Loop-back arrow (next frame): clean dashed loop UNDER the pipeline
     # Goes from Output bottom -> down -> left -> up to Tracking bottom
@@ -365,17 +398,17 @@ def main():
                      edgecolor="none"))
 
     # =========================================================
-    # ROW 2: Two innovation spotlights
-    # y range: 0.4 - 7.0 (much more vertical room)
+    # ROW 2: Two innovation spotlights (shorter / more compact)
+    # y range: 0.5 - 6.0 (height 5.5)
     # =========================================================
-    R2_Y = 0.4
-    R2_H = 6.6
+    R2_Y = 0.5
+    R2_H = 5.5
 
     # Section header
-    ax.text(CANVAS_W / 2, R2_Y + R2_H + 0.15,
-            "─── Innovation Spotlights ───",
-            ha="center", va="center", fontsize=12, fontweight="bold",
-            style="italic", color="#444")
+    # ax.text(CANVAS_W / 2, R2_Y + R2_H + 0.15,
+    #         "─── Innovation Spotlights ───",
+    #         ha="center", va="center", fontsize=12, fontweight="bold",
+    #         style="italic", color="#444")
 
     # ---- SPOTLIGHT 1: Visibility-Aware Pruning ----
     SP1_X, SP1_W = 0.4, 9.6
@@ -385,10 +418,10 @@ def main():
 
     star_badge(ax, SP1_X + 0.4, R2_Y + R2_H - 0.05, "1")
 
-    # Vertical positions for the 3 sub-sections (more breathing room)
-    y_a = R2_Y + R2_H - 1.3
-    y_b = R2_Y + R2_H - 3.1
-    y_c = R2_Y + R2_H - 4.9
+    # Vertical positions for the 3 sub-sections (compact)
+    y_a = R2_Y + R2_H - 1.05
+    y_b = R2_Y + R2_H - 2.55
+    y_c = R2_Y + R2_H - 3.95
 
     # ---- (a) CUDA-level extraction ----
     ax.text(SP1_X + 0.5, y_a, "(a)", ha="left", va="center",
@@ -427,7 +460,7 @@ def main():
 
     # ---- (c) Dual-mask pruning ----
     # Move (c) up a bit to leave clear room for the highlighted bottom equation
-    y_c_actual = y_c + 0.15
+    y_c_actual = y_c
     ax.text(SP1_X + 0.5, y_c_actual, "(c)", ha="left", va="center",
             fontsize=11, fontweight="bold", color="#8B6F00")
     ax.text(SP1_X + 0.95, y_c_actual, "Dual-mask pruning + opacity degeneration",
@@ -453,15 +486,15 @@ def main():
     )
     ax.add_patch(rule2)
     ax.text(SP1_X + 6.95, rule_y + 0.07,
-            r"Mask $D$:  $z_i^{cam} < d_{obs} - \gamma$",
+            r"Mask $D$:  $d_{obs} - z_i^{cam} > \gamma$",
             ha="center", va="center", fontsize=10, color="#222")
     ax.text(SP1_X + 6.95, rule_y - 0.18, "(distance / floater)",
             ha="center", va="center", fontsize=8.5, style="italic", color="#666")
 
     # Highlighted final equation at bottom (separated from rule boxes by gap)
-    eff_y = R2_Y + 0.45
+    eff_y = R2_Y + 0.3
     ax.text(SP1_X + SP1_W / 2, eff_y,
-            r"$\sigma_i \leftarrow \sigma_i \cdot \eta$  if  ($V \cup D$) — $\eta=0.90$, gradual decay",
+            r"$\sigma_i \leftarrow \sigma_i \cdot \eta$  if  ($V \cup D$), where $\eta=0.90$, gentle decay",
             ha="center", va="center", fontsize=11, color="#222",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF9E0",
                      edgecolor=BORDERS["inno1"], linewidth=1.5))
@@ -474,9 +507,9 @@ def main():
 
     star_badge(ax, SP2_X + 0.4, R2_Y + R2_H - 0.05, "2", color="#3B9C73")
 
-    y_a2 = R2_Y + R2_H - 1.3
-    y_b2 = R2_Y + R2_H - 3.1
-    y_c2 = R2_Y + R2_H - 4.9
+    y_a2 = R2_Y + R2_H - 1.05
+    y_b2 = R2_Y + R2_H - 2.1
+    y_c2 = R2_Y + R2_H - 3.95
 
     # ---- (a) Trigger ----
     ax.text(SP2_X + 0.5, y_a2, "(a)", ha="left", va="center",
@@ -485,7 +518,7 @@ def main():
             ha="left", va="center", fontsize=11, fontweight="bold", color="#222")
 
     ax.text(SP2_X + SP2_W / 2, y_a2 - 0.6,
-            "Reduces accumulated pose drift between widely-separated keyframes",
+            "To Reduce accumulated pose drift between widely-separated keyframes",
             ha="center", va="center", fontsize=10.5, style="italic", color="#444",
             bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#aaa"))
 
@@ -497,11 +530,11 @@ def main():
 
     tl_y = y_b2 - 0.85
     ax.plot([SP2_X + 0.7, SP2_X + 8.5], [tl_y, tl_y], color="#888", lw=1.0, zorder=2)
-    for x_off, label in [(1.0, r"$kf_3$"), (2.5, r"$kf_7$")]:
+    for x_off, label in [(1.0, r"$kf_1$"), (2.5, r"$kf_2$")]:
         camera_frustum(ax, SP2_X + x_off, tl_y, size=0.18, color="#3B9C73")
         ax.text(SP2_X + x_off, tl_y - 0.4, label, ha="center", va="top",
                 fontsize=8.5, color="#444")
-    for x_off, label in [(5.5, r"$kf_{28}$"), (6.7, r"$kf_{30}$"), (7.9, r"$kf_{32}$")]:
+    for x_off, label in [(5.5, r"$kf_{3}$"), (6.7, r"$kf_{4}$"), (7.9, r"$kf_{5}$")]:
         camera_frustum(ax, SP2_X + x_off, tl_y, size=0.18, color="#3B9C73")
         ax.text(SP2_X + x_off, tl_y - 0.4, label, ha="center", va="top",
                 fontsize=8.5, color="#444")
@@ -518,12 +551,14 @@ def main():
             ha="left", va="center", fontsize=11, fontweight="bold", color="#222")
 
     opt_y = y_c2_actual - 0.7
-    flame(ax, SP2_X + 1.6, opt_y, size=0.22)
+    # flame(ax, SP2_X + 1.6, opt_y, size=0.22)
+    camera_frustum(ax, SP2_X + 1.6, opt_y, size=0.18, color="#3B9C73")
     ax.text(SP2_X + 2.05, opt_y, "camera $\\hat{\\mathcal{T}}$",
             ha="left", va="center", fontsize=10.5, color="#222")
-    ax.text(SP2_X + 3.85, opt_y, "+", ha="center", va="center",
+    ax.text(SP2_X + 3.5, opt_y, "+", ha="center", va="center",
             fontsize=14, fontweight="bold", color="#444")
-    flame(ax, SP2_X + 4.4, opt_y, size=0.22)
+    # flame(ax, SP2_X + 4.4, opt_y, size=0.22)
+    gaussian_schematic(ax, SP2_X + 4.4, opt_y, n=3, scale=0.5)
     ax.text(SP2_X + 4.85, opt_y, "Gaussians",
             ha="left", va="center", fontsize=10.5, color="#222")
     ax.text(SP2_X + 7.15, opt_y, "20 iters,  ~1.5% overhead",

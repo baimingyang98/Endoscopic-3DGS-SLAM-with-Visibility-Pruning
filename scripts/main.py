@@ -1068,7 +1068,7 @@ def rgbd_slam(config: dict):
             innovation_cfg = config.get("innovations", {})
             if (innovation_cfg.get("enable_periodic_ba", False)
                     and time_idx > 0
-                    and (time_idx + 1) % innovation_cfg.get("ba_every_m_frames", 20) == 0
+                    and (time_idx + 1) % innovation_cfg.get("ba_every_m_frames", 50) == 0
                     and len(keyframe_list) >= 2):
                 print(f"\n--- Periodic BA at frame {time_idx} ---")
                 params, variables = periodic_bundle_adjustment(

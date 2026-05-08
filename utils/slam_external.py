@@ -337,16 +337,16 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                     and curr_data is not None
                     and transformed_pts is not None):
 
-                gamma = innovation_config.get("distance_gamma", 0.05)
-                eta = innovation_config.get("degeneration_eta", 0.2)
+                gamma = innovation_config.get("distance_gamma", 0.5)
+                eta = innovation_config.get("degeneration_eta", 0.9)
 
                 # Distance-based floater detection
                 floater_mask = compute_distance_mask(transformed_pts, curr_data, gamma=gamma)
 
                 # Visibility-based floater detection
                 if "vis_history" in variables and "vis_frame_count" in variables:
-                    vis_threshold = innovation_config.get("vis_threshold", 0.3)
-                    min_obs = innovation_config.get("min_observations", 5)
+                    vis_threshold = innovation_config.get("vis_threshold", 0.05)
+                    min_obs = innovation_config.get("min_observations", 50)
 
                     N = floater_mask.shape[0]
                     vis_hist = _resize_to_N(variables["vis_history"], N)
@@ -428,9 +428,9 @@ def update_three_way_classifier(variables, gauss_vis, innovation_config):
 
     # Three-way classification (only when deformation is enabled)
     if innovation_config.get("enable_deformation", False):
-        vis_threshold = innovation_config.get("vis_threshold", 0.3)
+        vis_threshold = innovation_config.get("vis_threshold", 0.05)
         var_threshold = innovation_config.get("var_threshold", 0.1)
-        min_obs = innovation_config.get("min_observations", 5)
+        min_obs = innovation_config.get("min_observations", 50)
 
         vis_mean = variables["vis_history"][:N].mean(dim=1)
         vis_var = variables["vis_history"][:N].var(dim=1)

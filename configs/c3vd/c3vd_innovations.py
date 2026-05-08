@@ -153,39 +153,42 @@ config = dict(
 
     # ============================================================
     # INNOVATION CONFIG - Toggle each independently
+    # These values match the notebook's final cell-20 config that produced
+    # the published results: PSNR 22.46, RMSE 1.62, ATE 0.46 on sigmoid_t3_a.
     # ============================================================
     innovations=dict(
         # --- Innovation 1: Visibility-aware dual-mask pruning ---
         enable_visibility_pruning=True,
-        distance_gamma=0.05,          # Depth diff threshold for floater detection
-        degeneration_eta=0.2,         # Opacity degeneration factor (multiply)
-        vis_threshold=0.3,            # Min mean visibility to be considered valid
-        min_observations=5,           # Min frames before visibility pruning activates
+        distance_gamma=0.5,           # Depth diff threshold for floater detection
+        degeneration_eta=0.9,         # Opacity degeneration factor (gentle 10% reduction)
+        vis_threshold=0.05,           # Min mean visibility to be considered valid
+        min_observations=50,          # Min frames before visibility pruning activates
         vis_window_size=15,           # Circular buffer size for visibility history
 
         # --- Innovation 2: Periodic Bundle Adjustment ---
         enable_periodic_ba=True,
-        ba_every_m_frames=20,         # BA trigger frequency (frames)
+        ba_every_m_frames=50,         # BA trigger frequency (frames)
         ba_n_keyframes=5,             # Number of keyframes per BA session
-        ba_num_iters=30,              # BA optimization iterations per session
+        ba_num_iters=20,              # BA optimization iterations per session
         ba_selection="hybrid",        # Keyframe selection: 'uniform', 'recent', 'hybrid'
         ba_lrs=dict(
-            means3D=0.00005,
-            rgb_colors=0.001,
-            unnorm_rotations=0.0005,
-            logit_opacities=0.025,
-            log_scales=0.0005,
-            cam_unnorm_rots=0.001,    # Non-zero: camera poses get gradients during BA
-            cam_trans=0.002,
+            means3D=0.00002,
+            rgb_colors=0.0005,
+            unnorm_rotations=0.0002,
+            logit_opacities=0.01,
+            log_scales=0.0002,
+            cam_unnorm_rots=0.0005,   # Non-zero: camera poses get gradients during BA
+            cam_trans=0.001,
         ),
 
         # --- Innovation 3: Deformation modeling (experimental) ---
-        enable_deformation=True,
+        # Disabled for C3VD (rigid scenes); enable on StereoMIS for deformation
+        enable_deformation=False,
         deform_lr=0.0005,
         var_threshold=0.1,            # Visibility variance threshold for deformation
         lambda_deform_temporal=0.1,
         lambda_deform_magnitude=0.01,
-        enable_deform_weighted_tracking=True,
+        enable_deform_weighted_tracking=False,
     ),
 
     # --------------------------------------------------------

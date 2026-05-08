@@ -1,18 +1,31 @@
 """Data manipulation utilities for image/intrinsics/pose processing."""
+from typing import Union
+
 import torch
 import numpy as np
 
 
-def normalize_image(rgb: torch.Tensor) -> torch.Tensor:
-    """Normalize image from [0, 255] to [0, 1]."""
-    return rgb.float() / 255.0
+def normalize_image(rgb: Union[torch.Tensor, np.ndarray]):
+    """Normalize image from [0, 255] to [0, 1]. Handles both tensors and numpy arrays."""
+    if torch.is_tensor(rgb):
+        return rgb.float() / 255.0
+    elif isinstance(rgb, np.ndarray):
+        return rgb.astype(float) / 255.0
+    else:
+        raise TypeError(f"Unsupported input rgb type: {type(rgb)}")
 
 
-def channels_first(image: torch.Tensor) -> torch.Tensor:
-    """Convert (H, W, C) to (C, H, W)."""
-    if image.dim() == 3 and image.shape[-1] in (1, 3, 4):
-        return image.permute(2, 0, 1)
-    return image
+def channels_first(rgb: Union[torch.Tensor, np.ndarray]):
+    """Convert (..., H, W, C) to (..., C, H, W). Handles both tensors and numpy arrays."""
+    if isinstance(rgb, np.ndarray):
+        if rgb.ndim >= 3 and rgb.shape[-1] in (1, 3, 4):
+            return np.moveaxis(rgb, -1, -3)
+        return rgb
+    if torch.is_tensor(rgb):
+        if rgb.dim() >= 3 and rgb.shape[-1] in (1, 3, 4):
+            return rgb.permute(*range(rgb.dim() - 3), -1, -3, -2)
+        return rgb
+    raise TypeError(f"Unsupported input rgb type: {type(rgb)}")
 
 
 def scale_intrinsics(intrinsics: torch.Tensor, sy: float, sx: float) -> torch.Tensor:

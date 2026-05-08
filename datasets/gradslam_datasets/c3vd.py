@@ -77,13 +77,13 @@ class C3VDDataset(GradSLAMDataset):
             self.poses = [self.poses[i] for i in train_idx]
             self.retained_inds = torch.arange(self.num_imgs)[train_idx]
 
-            # Apply stride to training set
-            self.color_paths = self.color_paths[self.start::stride]
-            self.depth_paths = self.depth_paths[self.start::stride]
+            # Apply stride to training set (match original EndoGSLAM exactly)
+            self.color_paths = self.color_paths[self.start: len(self.color_paths): stride]
+            self.depth_paths = self.depth_paths[self.start: len(self.depth_paths): stride]
             if self.load_embeddings:
-                self.embedding_paths = self.embedding_paths[self.start::stride]
-            self.poses = self.poses[self.start::stride]
-            self.retained_inds = self.retained_inds[self.start::stride]
+                self.embedding_paths = self.embedding_paths[self.start: len(self.embedding_paths): stride]
+            self.poses = self.poses[self.start: len(self.poses): stride]
+            self.retained_inds = torch.arange(self.num_imgs)[self.start: len(self.retained_inds): stride]
         else:
             # 'all' mode - use base class stride logic
             super().train_test_split(stride)

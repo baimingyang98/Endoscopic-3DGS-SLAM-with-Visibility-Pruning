@@ -171,26 +171,34 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def _preprocess_color(self, color: np.ndarray) -> np.ndarray:
-        """Resize color image to desired resolution."""
-        if color.shape[0] != self.desired_height or color.shape[1] != self.desired_width:
+        """Resize color image to desired resolution.
+
+        NOTE: matches the original EndoGSLAM behaviour (uses `and` not `or`
+        in the resize condition). Some downstream code may depend on this.
+        """
+        if color.shape[0] != self.desired_height and color.shape[1] != self.desired_width:
             color = cv2.resize(
                 color,
                 (self.desired_width, self.desired_height),
                 interpolation=cv2.INTER_LINEAR,
             )
         if self.normalize_color:
-            color = color.astype(np.float32) / 255.0
+            color = datautils.normalize_image(color)
+        if self.channels_first:
+            color = datautils.channels_first(color)
         return color
 
     def _preprocess_depth(self, depth: np.ndarray) -> np.ndarray:
         """Resize depth, add channel dim, scale to metric units."""
-        if depth.shape[0] != self.desired_height or depth.shape[1] != self.desired_width:
+        if depth.shape[0] != self.desired_height and depth.shape[1] != self.desired_width:
             depth = cv2.resize(
                 depth.astype(float),
                 (self.desired_width, self.desired_height),
                 interpolation=cv2.INTER_NEAREST,
             )
         depth = np.expand_dims(depth, -1)
+        if self.channels_first:
+            depth = datautils.channels_first(depth)
         return depth / self.png_depth_scale
 
     def _preprocess_poses(self, poses: torch.Tensor) -> torch.Tensor:
@@ -219,9 +227,12 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         color = np.asarray(imageio.imread(color_path), dtype=float)
 
         # Load depth
-        if ".tiff" in depth_path or ".tif" in depth_path:
-            depth = np.array(PIL.Image.open(depth_path), dtype=np.float64)
-        elif ".npy" in depth_path:
+        # IMPORTANT: matches original EndoGSLAM behaviour exactly. The original
+        # code had `if ".png" or '.jpg' in depth_path:` which always evaluates
+        # to True (non-empty string is truthy), so it ALWAYS used imageio.imread
+        # for .tiff files. Using PIL.Image.open instead gives different scaled
+        # values for 16-bit TIFFs, breaking tracking.
+        if ".npy" in depth_path:
             depth = np.load(depth_path).astype(np.float64)
         else:
             depth = np.asarray(imageio.imread(depth_path), dtype=np.float64)
@@ -245,6 +256,16 @@ class GradSLAMDataset(torch.utils.data.Dataset):
         intrinsics[:3, :3] = K
 
         pose = self.transformed_poses[index]
+
+        if self.load_embeddings:
+            embedding = self.read_embedding_from_file(self.embedding_paths[index])
+            return (
+                color.to(self.device).type(self.dtype),
+                depth.to(self.device).type(self.dtype),
+                intrinsics.to(self.device).type(self.dtype),
+                pose.to(self.device).type(self.dtype),
+                embedding.to(self.device),
+            )
 
         return (
             color.to(self.device).type(self.dtype),
