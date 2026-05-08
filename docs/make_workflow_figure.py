@@ -10,12 +10,6 @@ Produces docs/workflow_figure.png — a high-resolution figure with:
 
 Usage:
     python docs/make_workflow_figure.py
-
-Required input images (defaults to C:/Users/lenov/OneDrive/Desktop/pic4project):
-    215/215f_gt.png        # GT RGB
-    215/215_bl.png         # baseline rendering
-    215/215_ours.png       # our rendering
-    depth_est.png          # depth example
 """
 import os
 from pathlib import Path
@@ -34,16 +28,19 @@ from PIL import Image
 PIC_DIR = Path(r"C:/Users/lenov/OneDrive/Desktop/pic4project")
 OUTPUT = Path(__file__).parent / "workflow_figure.png"
 
-# Pastel color palette (matched to common SLAM papers)
+# Canvas size (in matplotlib coordinates)
+CANVAS_W = 20.0
+CANVAS_H = 13.0
+
 COLORS = {
-    "init":   "#FFE4E1",  # misty rose
-    "track":  "#D4F1D4",  # light green
-    "expand": "#FFF4D6",  # cream
-    "map":    "#EAF3FF",  # very light blue
-    "inno1":  "#FFD6E1",  # light pink (Innovation 1)
-    "inno2":  "#D6F0E8",  # mint   (Innovation 2)
-    "inno3":  "#FFE0B5",  # peach  (Innovation 3)
-    "out":    "#E8E8F4",  # lavender grey
+    "init":   "#FFE4E1",
+    "track":  "#D4F1D4",
+    "expand": "#FFF4D6",
+    "map":    "#EAF3FF",
+    "inno1":  "#FFD6E1",
+    "inno2":  "#D6F0E8",
+    "inno3":  "#FFE0B5",
+    "out":    "#E8E8F4",
     "edge":   "#444444",
     "arrow":  "#555555",
 }
@@ -60,7 +57,7 @@ BORDERS = {
 }
 
 
-def load_img(path, max_side=300):
+def load_img(path, max_side=320):
     img = Image.open(path).convert("RGB")
     w, h = img.size
     scale = max_side / max(w, h)
@@ -70,7 +67,7 @@ def load_img(path, max_side=300):
 
 
 def add_module(ax, x, y, w, h, title, color_key, title_size=11):
-    """Draw a rounded module box with a title bar (title floats on top edge)."""
+    """Rounded module box with floating title pill on top."""
     fill = COLORS[color_key]
     border = BORDERS[color_key]
 
@@ -83,12 +80,11 @@ def add_module(ax, x, y, w, h, title, color_key, title_size=11):
     )
     ax.add_patch(box)
 
-    # Title pill
-    title_w = max(2.2, 0.18 * len(title) + 0.9)
+    title_w = max(2.4, 0.18 * len(title) + 1.0)
     title_x = x + (w - title_w) / 2
-    title_y = y + h - 0.28
+    title_y = y + h - 0.30
     title_box = FancyBboxPatch(
-        (title_x, title_y), title_w, 0.55,
+        (title_x, title_y), title_w, 0.6,
         boxstyle="round,pad=0.02,rounding_size=0.12",
         linewidth=1.5, linestyle=(0, (4, 2)),
         facecolor="white", edgecolor=border,
@@ -96,14 +92,14 @@ def add_module(ax, x, y, w, h, title, color_key, title_size=11):
     )
     ax.add_patch(title_box)
     ax.text(
-        title_x + title_w / 2, title_y + 0.275, title,
+        title_x + title_w / 2, title_y + 0.30, title,
         ha="center", va="center",
         fontsize=title_size, fontweight="bold", color="#222",
         zorder=3,
     )
 
 
-def add_image(ax, img, x, y, zoom=0.40, label=None, label_pos="below", label_size=8.5):
+def add_image(ax, img, x, y, zoom=0.30, label=None, label_pos="below", label_size=9):
     imagebox = OffsetImage(img, zoom=zoom)
     ab = AnnotationBbox(imagebox, (x, y), frameon=True,
                         bboxprops=dict(edgecolor="#666", linewidth=0.8),
@@ -111,10 +107,10 @@ def add_image(ax, img, x, y, zoom=0.40, label=None, label_pos="below", label_siz
     ax.add_artist(ab)
     if label:
         if label_pos == "below":
-            ax.text(x, y - 0.65, label, ha="center", va="top",
+            ax.text(x, y - 0.75, label, ha="center", va="top",
                     fontsize=label_size, style="italic", zorder=5)
         elif label_pos == "above":
-            ax.text(x, y + 0.65, label, ha="center", va="bottom",
+            ax.text(x, y + 0.75, label, ha="center", va="bottom",
                     fontsize=label_size, style="italic", zorder=5)
 
 
@@ -157,7 +153,6 @@ def camera_frustum(ax, cx, cy, size=0.25, color="#FFA94D"):
 
 
 def snowflake(ax, x, y, size=0.3, color="#5BB3D6"):
-    """Draw a simple snowflake-like icon (used for 'frozen' indicator)."""
     for ang in [0, 60, 120]:
         rad = np.deg2rad(ang)
         dx, dy = size * np.cos(rad), size * np.sin(rad)
@@ -166,7 +161,6 @@ def snowflake(ax, x, y, size=0.3, color="#5BB3D6"):
 
 
 def flame(ax, x, y, size=0.25, color="#E26A3A"):
-    """Draw a simple flame-like teardrop (used for 'activate' indicator)."""
     pts = np.array([
         [x, y + size],
         [x + size * 0.6, y + size * 0.2],
@@ -211,209 +205,221 @@ def main():
     else:
         imgs["depth_crop"] = imgs["depth"]
 
-    # Larger figure to give breathing room
-    fig, ax = plt.subplots(figsize=(18, 10), dpi=160)
-    ax.set_xlim(0, 18)
-    ax.set_ylim(0, 10)
+    fig, ax = plt.subplots(figsize=(CANVAS_W, CANVAS_H), dpi=160)
+    ax.set_xlim(0, CANVAS_W)
+    ax.set_ylim(0, CANVAS_H)
     ax.set_aspect("equal")
     ax.axis("off")
     fig.patch.set_facecolor("white")
 
     # Title
-    ax.text(9, 9.65,
+    ax.text(CANVAS_W / 2, CANVAS_H - 0.4,
             "Visibility-Driven Gaussian Map Management for Endoscopic SLAM",
-            ha="center", va="center", fontsize=14, fontweight="bold")
+            ha="center", va="center", fontsize=16, fontweight="bold")
 
     # =========================================================
-    # ROW 1 (top, y=5.4-9.0): Init -> Tracking -> Expansion -> Output preview
+    # ROW 1 (top): Init -> Tracking -> Expansion -> Output
+    # y range: 8.0 - 12.2
     # =========================================================
+    R1_Y = 8.0
+    R1_H = 4.2
 
     # ---- Initialization ----
-    add_module(ax, 0.3, 5.4, 4.0, 3.6, "Initialization", "init")
-    add_image(ax, imgs["rgb"],   1.4, 7.6, zoom=0.4, label="RGB")
-    add_image(ax, imgs["depth_crop"], 3.2, 7.6, zoom=0.4, label="Depth")
-    ax.annotate("$\\mathcal{G}_0$", xy=(2.3, 6.3), ha="center", va="center",
-                fontsize=15, fontweight="bold", color="#444", zorder=5)
-    add_arrow(ax, 2.55, 6.3, 3.05, 6.3, lw=1.8, color=COLORS["arrow"])
-    gaussian_schematic(ax, 3.5, 6.3, n=5, scale=0.55)
-    ax.text(3.5, 5.65, "3D Gaussians", ha="center", va="top",
-            fontsize=9, style="italic", color="#444")
+    add_module(ax, 0.4, R1_Y, 4.4, R1_H, "Initialization", "init")
+    add_image(ax, imgs["rgb"],   1.55, R1_Y + 2.5, zoom=0.30, label="RGB")
+    add_image(ax, imgs["depth_crop"], 3.55, R1_Y + 2.5, zoom=0.26, label="Depth")
+    ax.annotate("$\\mathcal{G}_0$", xy=(2.4, R1_Y + 1.0), ha="center", va="center",
+                fontsize=16, fontweight="bold", color="#444", zorder=5)
+    add_arrow(ax, 2.7, R1_Y + 1.0, 3.2, R1_Y + 1.0, lw=1.8, color=COLORS["arrow"])
+    gaussian_schematic(ax, 3.7, R1_Y + 1.0, n=5, scale=0.6)
+    ax.text(3.7, R1_Y + 0.3, "3D Gaussians", ha="center", va="top",
+            fontsize=10, style="italic", color="#444")
 
     # ---- Tracking ----
-    add_module(ax, 4.6, 5.4, 5.0, 3.6, "Tracking Module", "track")
-    camera_frustum(ax, 5.4, 7.7, size=0.32, color="#E58C2A")
-    ax.text(5.4, 8.1, "$\\hat{\\mathcal{T}}_t$", ha="center", va="bottom",
-            fontsize=12, fontweight="bold")
-    add_arrow(ax, 5.85, 7.75, 6.55, 7.75, lw=1.8)
-    camera_frustum(ax, 7.0, 7.7, size=0.32, color="#E58C2A")
-    ax.text(7.0, 8.1, "$\\hat{\\mathcal{T}}_{t+1}$", ha="center", va="bottom",
-            fontsize=12, fontweight="bold")
+    add_module(ax, 5.1, R1_Y, 5.4, R1_H, "Tracking Module", "track")
+    camera_frustum(ax, 6.1, R1_Y + 2.7, size=0.36, color="#E58C2A")
+    ax.text(6.1, R1_Y + 3.2, "$\\hat{\\mathcal{T}}_t$", ha="center", va="bottom",
+            fontsize=14, fontweight="bold")
+    add_arrow(ax, 6.6, R1_Y + 2.75, 7.4, R1_Y + 2.75, lw=1.8)
+    camera_frustum(ax, 7.95, R1_Y + 2.7, size=0.36, color="#E58C2A")
+    ax.text(7.95, R1_Y + 3.2, "$\\hat{\\mathcal{T}}_{t+1}$", ha="center", va="bottom",
+            fontsize=14, fontweight="bold")
 
-    # Frozen Gaussians indicator
-    snowflake(ax, 8.4, 7.75, size=0.25, color="#5BB3D6")
-    ax.text(8.4, 7.25, "Frozen\nGaussians", ha="center", va="center",
-            fontsize=8.5, color="#444")
+    snowflake(ax, 9.4, R1_Y + 2.75, size=0.28, color="#5BB3D6")
+    ax.text(9.4, R1_Y + 2.15, "Frozen\nGaussians", ha="center", va="center",
+            fontsize=9.5, color="#444")
 
-    ax.text(7.1, 6.6, r"$\mathcal{L}_{tr} = w_d\|D-\hat D\|_1 + w_c\|C-\hat C\|_1$",
-            ha="center", va="center", fontsize=10.5,
+    ax.text(7.8, R1_Y + 1.4, r"$\mathcal{L}_{tr} = w_d\|D-\hat D\|_1 + w_c\|C-\hat C\|_1$",
+            ha="center", va="center", fontsize=11.5,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#888"))
-    ax.text(7.1, 5.85, "Adam Optimizer (camera params only)",
-            ha="center", va="center", fontsize=9, style="italic", color="#444")
+    ax.text(7.8, 8.4, "Adam Optimizer (camera params only)",
+            ha="center", va="center", fontsize=10, style="italic", color="#444")
 
     # ---- Gaussian Expansion ----
-    add_module(ax, 9.9, 5.4, 4.2, 3.6, "Gaussian Expansion", "expand")
-    ax.add_patch(mpatches.Rectangle((10.55, 6.7), 1.4, 1.4, facecolor="#222",
+    add_module(ax, 10.8, R1_Y, 4.6, R1_H, "Gaussian Expansion", "expand")
+    ax.add_patch(mpatches.Rectangle((11.45, R1_Y + 1.8), 1.6, 1.6, facecolor="#222",
                                     edgecolor="#666", linewidth=1.0, zorder=4))
-    ax.text(11.25, 7.4, "$\\mathcal{G}_t$\nrendered", ha="center", va="center",
-            fontsize=9.5, color="white", zorder=5)
-    add_arrow(ax, 12.05, 7.4, 12.65, 7.4, lw=1.8)
-    ax.add_patch(mpatches.Rectangle((12.65, 6.7), 1.4, 1.4, facecolor="#FFF4D6",
+    ax.text(12.25, R1_Y + 2.6, "$\\mathcal{G}_t$\nrendered", ha="center", va="center",
+            fontsize=10, color="white", zorder=5)
+    add_arrow(ax, 13.2, R1_Y + 2.6, 13.85, R1_Y + 2.6, lw=1.8)
+    ax.add_patch(mpatches.Rectangle((13.85, R1_Y + 1.8), 1.6, 1.6, facecolor="#FFF4D6",
                                     edgecolor="#666", linewidth=1.0, zorder=4))
-    gaussian_schematic(ax, 13.35, 7.4, n=4, scale=0.4)
-    ax.text(11.25, 6.55, "Silhouette mask", ha="center", va="top",
-            fontsize=8.5, style="italic")
-    ax.text(13.35, 6.55, "Add new", ha="center", va="top",
-            fontsize=8.5, style="italic")
-    ax.text(12.0, 6.0,
+    gaussian_schematic(ax, 14.65, R1_Y + 2.6, n=4, scale=0.45)
+    ax.text(12.25, R1_Y + 1.55, "Silhouette mask", ha="center", va="top",
+            fontsize=9, style="italic")
+    ax.text(14.65, R1_Y + 1.55, "Add new", ha="center", va="top",
+            fontsize=9, style="italic")
+    ax.text(13.1, R1_Y + 0.85,
             "Add Gaussians where rendered\nsilhouette < $\\tau$ or depth disagrees",
-            ha="center", va="center", fontsize=9.5, color="#444")
+            ha="center", va="center", fontsize=10, color="#444")
 
-    # ---- Top-right: Output preview ----
-    add_module(ax, 14.4, 5.4, 3.4, 3.6, "Output (Comparison)", "out")
-    add_image(ax, imgs["rgb"],      15.2, 7.85, zoom=0.35, label="GT")
-    add_image(ax, imgs["baseline"], 16.95, 7.85, zoom=0.35, label="Baseline")
-    add_image(ax, imgs["ours"],     16.05, 6.15, zoom=0.35, label="Ours ($\\eta$=0.90)")
-
-    # =========================================================
-    # ROW 1 -> ROW 2 connecting arrow
-    # =========================================================
-    add_arrow(ax, 7.1, 5.4, 7.1, 5.05, lw=2.2, color="#444")
+    # ---- Output ----
+    add_module(ax, 15.7, R1_Y, 4.0, R1_H, "Output (Comparison)", "out")
+    add_image(ax, imgs["rgb"],      16.65, R1_Y + 3.0, zoom=0.16, label="GT")
+    add_image(ax, imgs["baseline"], 18.65, R1_Y + 3.0, zoom=0.16, label="Baseline")
+    add_image(ax, imgs["ours"],     17.7, R1_Y + 1.1, zoom=0.16, label="Ours ($\\eta$=0.90)")
 
     # =========================================================
-    # ROW 2 (bottom, y=0.3-5.0): Mapping Module containing 3 innovations
+    # ROW 1 -> ROW 2 connector
     # =========================================================
-    
-    add_module(ax, 0.3, 0.3, 17.5, 4.7, "Mapping Module with Innovations", "map",
-               title_size=12)
+    add_arrow(ax, 7.8, R1_Y, 7.8, 7.7, lw=2.4, color="#444")
 
-    # Modified CUDA rasterizer (the technical foundation)
+    # =========================================================
+    # ROW 2 (bottom): Mapping Module containing 3 innovations
+    # y range: 0.4 - 7.4
+    # =========================================================
+    R2_Y = 0.4
+    R2_H = 7.0
+
+    add_module(ax, 0.3, R2_Y, CANVAS_W - 0.6, R2_H,
+               "Mapping Module with Innovations", "map", title_size=13)
+
+    # Modified CUDA rasterizer (foundation, full-width inside the box)
+    rast_y = R2_Y + R2_H - 1.5
     rast_box = FancyBboxPatch(
-        (1.0, 3.55), 15.5, 0.95,
+        (1.0, rast_y), CANVAS_W - 2.0, 1.0,
         boxstyle="round,pad=0.02,rounding_size=0.12",
         linewidth=1.5, facecolor="white", edgecolor=BORDERS["map"],
         zorder=2,
     )
     ax.add_patch(rast_box)
-    # Wrench icon (replaced with cogs symbol from matplotlib's default fonts)
-    ax.text(2.0, 4.05, "⚙", ha="center", va="center", fontsize=20, color="#5577AA")
-    ax.text(8.7, 4.20, "Modified CUDA Rasterizer",
-            ha="center", va="center", fontsize=12, fontweight="bold", color="#222")
-    ax.text(8.7, 3.78,
+    ax.text(2.0, rast_y + 0.5, "⚙", ha="center", va="center",
+            fontsize=22, color="#5577AA")
+    ax.text(CANVAS_W / 2, rast_y + 0.7, "Modified CUDA Rasterizer",
+            ha="center", va="center", fontsize=13, fontweight="bold", color="#222")
+    ax.text(CANVAS_W / 2, rast_y + 0.25,
             r"output: per-Gaussian visibility  $V_i = \sum_p \alpha_i^{(p)} \cdot T^{(p)}$  (free piggyback on alpha-blending)",
-            ha="center", va="center", fontsize=10, style="italic", color="#444")
-    
-    # Three arrows down to innovations
-    for ax_x in [2.4, 8.7, 14.7]:
-        add_arrow(ax, ax_x, 3.55, ax_x, 3.25, lw=1.6, color=BORDERS["map"])
+            ha="center", va="center", fontsize=11, style="italic", color="#444")
+
+    # Three downward arrows from rasterizer to innovations
+    inno_centers_x = [3.0, 9.85, 16.7]
+    for cx in inno_centers_x:
+        add_arrow(ax, cx, rast_y, cx, rast_y - 0.5, lw=1.8, color=BORDERS["map"])
+
+    # Innovation boxes (more spacious now)
+    INO_Y = R2_Y + 0.4
+    INO_H = R2_H - 2.5  # 4.5 high - lots of room
 
     # ---- Innovation 1: Visibility Pruning ----
-    add_module(ax, 0.6, 0.55, 5.2, 2.65, "Innovation 1 — Visibility Pruning", "inno1")
-    
-    # Visibility buffer schematic
-    buf_y = 2.45
+    INO1_X, INO1_W = 0.7, 5.5
+    add_module(ax, INO1_X, INO_Y, INO1_W, INO_H,
+               "Innovation 1 — Visibility Pruning", "inno1")
+
+    # Visibility buffer
+    buf_y = INO_Y + INO_H - 1.4
     for i, alpha in enumerate([0.3, 0.5, 0.7, 0.9, 1.0, 0.85, 0.7, 0.5]):
-        ax.add_patch(mpatches.Rectangle((1.1 + i*0.42, buf_y), 0.4, 0.32,
+        ax.add_patch(mpatches.Rectangle((INO1_X + 0.4 + i*0.55, buf_y), 0.5, 0.42,
                                         facecolor=plt.cm.viridis(alpha),
                                         edgecolor="#444", linewidth=0.5, zorder=4))
-    ax.text(3.2, 2.18, "Visibility history buffer ($W$=15 frames)",
-            ha="center", va="top", fontsize=8.5, style="italic", color="#444")
+    ax.text(INO1_X + INO1_W/2, buf_y - 0.25,
+            "Visibility history buffer ($W$=15 frames)",
+            ha="center", va="top", fontsize=10, style="italic", color="#444")
 
     # Three-way classifier
-    ax.text(3.2, 1.55, "Three-way classifier:", ha="center", va="center",
-            fontsize=10, fontweight="bold")
-    
-    cls_y = 1.05
-    ax.text(1.4, cls_y, "STATIC", ha="center", va="center", fontsize=9, fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.18", facecolor="#A8E6A8", edgecolor="#5BA05B"))
-    ax.text(3.2, cls_y, "DEFORM", ha="center", va="center", fontsize=9, fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.18", facecolor="#FFD08A", edgecolor="#CC8030"))
-    ax.text(5.0, cls_y, "FLOATER", ha="center", va="center", fontsize=9, fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.18", facecolor="#FFA8A8", edgecolor="#CC5050"))
+    cls_label_y = INO_Y + 1.7
+    ax.text(INO1_X + INO1_W/2, cls_label_y, "Three-way classifier:",
+            ha="center", va="center", fontsize=11.5, fontweight="bold")
 
-    ax.text(3.2, 0.7, r"opacity degeneration:  $\sigma \leftarrow \sigma \cdot \eta$,  $\eta=0.90$",
-            ha="center", va="center", fontsize=10, style="italic", color="#333",
-            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="#888"))
+    cls_y = INO_Y + 1.05
+    ax.text(INO1_X + 0.9, cls_y, "STATIC", ha="center", va="center",
+            fontsize=10, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#A8E6A8", edgecolor="#5BA05B"))
+    ax.text(INO1_X + INO1_W/2, cls_y, "DEFORM", ha="center", va="center",
+            fontsize=10, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#FFD08A", edgecolor="#CC8030"))
+    ax.text(INO1_X + INO1_W - 0.95, cls_y, "FLOATER", ha="center", va="center",
+            fontsize=10, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#FFA8A8", edgecolor="#CC5050"))
+
+    ax.text(INO1_X + INO1_W/2, INO_Y + 0.45,
+            r"opacity degeneration:  $\sigma \leftarrow \sigma \cdot \eta$,  $\eta=0.90$",
+            ha="center", va="center", fontsize=11, style="italic", color="#333",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888"))
 
     # ---- Innovation 2: Periodic BA ----
-    add_module(ax, 6.05, 0.55, 5.5, 2.65, "Innovation 2 — Periodic BA", "inno2")
+    INO2_X, INO2_W = 7.1, 5.6
+    add_module(ax, INO2_X, INO_Y, INO2_W, INO_H,
+               "Innovation 2 — Periodic BA", "inno2")
 
-    # Five keyframes
-    for i, x in enumerate([6.5, 7.05, 7.6, 8.15, 8.7]):
-        camera_frustum(ax, x, 2.4, size=0.18, color="#3B9C73")
-    ax.text(7.6, 2.85, "5 keyframes (hybrid: recent + random older)",
-            ha="center", va="bottom", fontsize=9, style="italic", color="#444")
+    # 5 keyframes
+    kf_y = INO_Y + INO_H - 1.3
+    for i, x_off in enumerate([0.6, 1.15, 1.7, 2.25, 2.8]):
+        camera_frustum(ax, INO2_X + x_off, kf_y, size=0.22, color="#3B9C73")
+    ax.text(INO2_X + 1.7, kf_y - 0.5,
+            "5 keyframes (hybrid: recent + random older)",
+            ha="center", va="center", fontsize=9.5, style="italic", color="#444")
 
-    # Joint optimization indicator
-    add_arrow(ax, 8.95, 2.4, 9.5, 2.4, lw=1.8, color=BORDERS["inno2"])
-    flame(ax, 9.85, 2.4, size=0.25)
-    ax.text(10.65, 2.4, "Joint cam +\nGaussian opt",
-            ha="center", va="center", fontsize=9, color="#333")
-
-    # Triggers and stats
-    ax.text(8.8, 1.55, r"Trigger: every $M = 50$ frames",
+    # Joint optimization
+    add_arrow(ax, INO2_X + 3.1, kf_y, INO2_X + 3.7, kf_y, lw=1.8, color=BORDERS["inno2"])
+    flame(ax, INO2_X + 4.05, kf_y, size=0.28)
+    ax.text(INO2_X + 5.0, kf_y, "Joint cam +\nGaussian opt",
             ha="center", va="center", fontsize=10, color="#333")
-    ax.text(8.8, 1.12, r"BA iterations: $20$    Overhead: $\sim 1.5\%$",
-            ha="center", va="center", fontsize=10, color="#333")
-    ax.text(8.8, 0.7,
+
+    # Stats
+    stats_y = INO_Y + 1.5
+    ax.text(INO2_X + INO2_W/2, stats_y,
+            r"Trigger: every $M = 50$ frames",
+            ha="center", va="center", fontsize=11, color="#333")
+    ax.text(INO2_X + INO2_W/2, stats_y - 0.6,
+            r"BA iterations: $20$    Overhead: $\sim 1.5\%$",
+            ha="center", va="center", fontsize=11, color="#333")
+    ax.text(INO2_X + INO2_W/2, stats_y - 1.2,
             r"Camera LR during BA: $\frac{1}{2}\times$ tracking LR (conservative)",
-            ha="center", va="center", fontsize=9, style="italic", color="#444")
+            ha="center", va="center", fontsize=10, style="italic", color="#444")
 
-    # ---- Innovation 3: Deformation Modeling ----
-    add_module(ax, 11.75, 0.55, 5.7, 2.65, "Innovation 3 — Deformation Modeling", "inno3")
+    # ---- Innovation 3: Deformation ----
+    INO3_X, INO3_W = 13.6, 6.1
+    add_module(ax, INO3_X, INO_Y, INO3_W, INO_H,
+               "Innovation 3 — Deformation Modeling", "inno3")
 
-    # Original -> deformed Gaussian schematic
-    e_static = Ellipse((12.4, 2.3), 0.5, 0.32, angle=20, facecolor="#A8D8F4",
+    # Original -> deformed Gaussian
+    e_static = Ellipse((INO3_X + 0.9, INO_Y + INO_H - 1.4), 0.55, 0.36,
+                      angle=20, facecolor="#A8D8F4",
                       edgecolor="#446", linewidth=1.0, zorder=4)
     ax.add_patch(e_static)
-    add_arrow(ax, 12.7, 2.3, 13.4, 2.05, lw=2.0, color="#E0682A")
-    e_deform = Ellipse((13.7, 1.95), 0.5, 0.32, angle=20, facecolor="#FFD08A",
+    add_arrow(ax, INO3_X + 1.25, INO_Y + INO_H - 1.4,
+              INO3_X + 2.05, INO_Y + INO_H - 1.65, lw=2.2, color="#E0682A")
+    e_deform = Ellipse((INO3_X + 2.4, INO_Y + INO_H - 1.7), 0.55, 0.36,
+                      angle=20, facecolor="#FFD08A",
                       edgecolor="#666", linewidth=1.0, zorder=4)
     ax.add_patch(e_deform)
-    ax.text(13.05, 2.75, r"$\Delta_{xyz}$ offset",
-            ha="center", va="bottom", fontsize=10, fontweight="bold", color="#E0682A")
+    ax.text(INO3_X + 1.65, INO_Y + INO_H - 0.7,
+            r"$\Delta_{xyz}$ offset",
+            ha="center", va="bottom", fontsize=11, fontweight="bold", color="#E0682A")
 
-    ax.text(15.7, 2.45, "Applied only to\nDEFORMING-class\nGaussians",
-            ha="center", va="center", fontsize=9.5, color="#333")
+    ax.text(INO3_X + 4.6, INO_Y + INO_H - 1.4,
+            "Applied only to\nDEFORMING-class\nGaussians",
+            ha="center", va="center", fontsize=10.5, color="#333")
 
-    ax.text(14.55, 1.4,
+    # Loss equation
+    ax.text(INO3_X + INO3_W/2, INO_Y + 1.4,
             r"$\mathcal{L}_{def} = \lambda_m\|\Delta\|_2 + \lambda_t\|\Delta_t-\Delta_{t-1}\|_2$",
-            ha="center", va="center", fontsize=10, style="italic", color="#333",
-            bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+            ha="center", va="center", fontsize=11.5, style="italic", color="#333",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
                      edgecolor="#aaa", linewidth=0.7))
-    
-    ax.text(14.55, 0.78, "Magnitude + Temporal Smoothness Regularization",
-            ha="center", va="center", fontsize=9, style="italic", color="#666")
-
-    # =========================================================
-    # Loop-back arrow: keyframe -> next frame tracking
-    # =========================================================
-    arrow_back = FancyArrowPatch(
-        (17.7, 0.6), (17.95, 0.6),
-        arrowstyle="-", mutation_scale=15, linewidth=1.5,
-        color="#888", linestyle="dashed", zorder=2,
-    )
-    # use a manual U-shaped arrow with line segments
-    line_pts = [(7.0, 5.0), (7.0, 5.05)]  # placeholder; actual loop drawn below
-
-    # Draw a faint loop-back from bottom to tracking
-    ax.plot([17.6, 17.95, 17.95, 0.15, 0.15, 4.6],
-            [2.5, 2.5, 9.4, 9.4, 7.2, 7.2],
-            color="#aaa", linestyle="dashed", linewidth=1.2, zorder=0)
-    add_arrow(ax, 0.4, 7.2, 4.6, 7.2, lw=0, color="#aaa")  # invisible (just to show direction)
-    ax.annotate("", xy=(4.6, 7.2), xytext=(4.4, 7.2),
-                arrowprops=dict(arrowstyle="->", color="#888", lw=1.4))
-    ax.text(0.5, 9.55, "next frame", ha="left", va="center",
-            fontsize=9, style="italic", color="#666")
+    ax.text(INO3_X + INO3_W/2, INO_Y + 0.55,
+            "Magnitude + Temporal Smoothness Regularization",
+            ha="center", va="center", fontsize=10, style="italic", color="#666")
 
     plt.tight_layout()
     OUTPUT.parent.mkdir(exist_ok=True, parents=True)
