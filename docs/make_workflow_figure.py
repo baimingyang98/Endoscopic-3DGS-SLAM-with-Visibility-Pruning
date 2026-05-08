@@ -80,7 +80,9 @@ def add_module(ax, x, y, w, h, title, color_key, title_size=11):
     )
     ax.add_patch(box)
 
-    title_w = max(2.4, 0.18 * len(title) + 1.0)
+    # Tight pill: width ~ text length * char-width + small horizontal padding
+    char_w = 0.115 * (title_size / 11.0)  # scales with font size
+    title_w = char_w * len(title) + 0.6
     title_x = x + (w - title_w) / 2
     title_y = y + h - 0.30
     title_box = FancyBboxPatch(
@@ -321,7 +323,7 @@ def main():
     INO_H = R2_H - 2.5  # 4.5 high - lots of room
 
     # ---- Innovation 1: Visibility Pruning ----
-    INO1_X, INO1_W = 0.7, 5.5
+    INO1_X, INO1_W = 0.7, 5.6
     add_module(ax, INO1_X, INO_Y, INO1_W, INO_H,
                "Innovation 1 — Visibility Pruning", "inno1")
 
