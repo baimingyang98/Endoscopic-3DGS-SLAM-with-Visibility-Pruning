@@ -103,7 +103,7 @@ def add_module(ax, x, y, w, h, title, color_key, title_size=11):
     )
 
 
-def add_image(ax, img, x, y, zoom=0.30, label=None, label_pos="below", label_size=8.5):
+def add_image(ax, img, x, y, zoom=0.40, label=None, label_pos="below", label_size=8.5):
     imagebox = OffsetImage(img, zoom=zoom)
     ab = AnnotationBbox(imagebox, (x, y), frameon=True,
                         bboxprops=dict(edgecolor="#666", linewidth=0.8),
@@ -230,8 +230,8 @@ def main():
 
     # ---- Initialization ----
     add_module(ax, 0.3, 5.4, 4.0, 3.6, "Initialization", "init")
-    add_image(ax, imgs["rgb"],   1.4, 7.6, zoom=0.25, label="RGB")
-    add_image(ax, imgs["depth_crop"], 3.2, 7.6, zoom=0.22, label="Depth")
+    add_image(ax, imgs["rgb"],   1.4, 7.6, zoom=0.4, label="RGB")
+    add_image(ax, imgs["depth_crop"], 3.2, 7.6, zoom=0.4, label="Depth")
     ax.annotate("$\\mathcal{G}_0$", xy=(2.3, 6.3), ha="center", va="center",
                 fontsize=15, fontweight="bold", color="#444", zorder=5)
     add_arrow(ax, 2.55, 6.3, 3.05, 6.3, lw=1.8, color=COLORS["arrow"])
@@ -280,9 +280,9 @@ def main():
 
     # ---- Top-right: Output preview ----
     add_module(ax, 14.4, 5.4, 3.4, 3.6, "Output (Comparison)", "out")
-    add_image(ax, imgs["rgb"],      15.2, 7.85, zoom=0.13, label="GT")
-    add_image(ax, imgs["baseline"], 16.95, 7.85, zoom=0.13, label="Baseline")
-    add_image(ax, imgs["ours"],     16.05, 6.15, zoom=0.13, label="Ours ($\\eta$=0.90)")
+    add_image(ax, imgs["rgb"],      15.2, 7.85, zoom=0.35, label="GT")
+    add_image(ax, imgs["baseline"], 16.95, 7.85, zoom=0.35, label="Baseline")
+    add_image(ax, imgs["ours"],     16.05, 6.15, zoom=0.35, label="Ours ($\\eta$=0.90)")
 
     # =========================================================
     # ROW 1 -> ROW 2 connecting arrow
@@ -414,23 +414,6 @@ def main():
                 arrowprops=dict(arrowstyle="->", color="#888", lw=1.4))
     ax.text(0.5, 9.55, "next frame", ha="left", va="center",
             fontsize=9, style="italic", color="#666")
-
-    # =========================================================
-    # Legend (bottom-left within a small white box)
-    # =========================================================
-    legend_box = FancyBboxPatch(
-        (0.05, 9.05), 4.7, 0.55,
-        boxstyle="round,pad=0.05,rounding_size=0.1",
-        linewidth=0.8, facecolor="white", edgecolor="#999",
-        zorder=8,
-    )
-    ax.add_patch(legend_box)
-    flame(ax, 0.4, 9.32, size=0.16)
-    ax.text(0.65, 9.32, "Activate (gradient on)",
-            ha="left", va="center", fontsize=9.5, color="#333", zorder=9)
-    snowflake(ax, 2.6, 9.32, size=0.18, color="#5BB3D6")
-    ax.text(2.85, 9.32, "Frozen (no gradient)",
-            ha="left", va="center", fontsize=9.5, color="#333", zorder=9)
 
     plt.tight_layout()
     OUTPUT.parent.mkdir(exist_ok=True, parents=True)
