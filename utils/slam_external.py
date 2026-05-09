@@ -360,14 +360,20 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                 else:
                     combined_floater = floater_mask
 
-                # Degenerate opacity of floaters (gradual, not hard delete)
+                # Degenerate opacity of floaters (gradual, not hard delete).
+                # FIX B: route this through update_params_and_optimizer() so
+                # Adam's exp_avg / exp_avg_sq are CLEARED for the rewritten
+                # tensor. Direct .data.copy_() left the old momentum stale,
+                # which made opacities oscillate wildly around the prune
+                # threshold across iterations.
                 with torch.no_grad():
                     if combined_floater.any():
                         opacities = torch.sigmoid(params["logit_opacities"].squeeze())
                         opacities[combined_floater] = opacities[combined_floater] * eta
                         opacities = opacities.clamp(1e-6, 1 - 1e-6)
                         new_logit = torch.log(opacities / (1 - opacities)).unsqueeze(-1)
-                        params["logit_opacities"].data.copy_(new_logit)
+                        new_params = {"logit_opacities": new_logit}
+                        params = update_params_and_optimizer(new_params, params, optimizer)
 
             # Standard opacity-based removal
             to_remove = (torch.sigmoid(params["logit_opacities"]) < remove_threshold).squeeze()
@@ -424,7 +430,12 @@ def update_three_way_classifier(variables, gauss_vis, innovation_config):
     col = variables["vis_write_idx"] % W
     variables["vis_history"][:N, col] = gauss_vis[:N].detach()
     variables["vis_write_idx"] = (variables["vis_write_idx"] + 1) % W
-    variables["vis_frame_count"][:N] += 1
+    # FIX D: count only Gaussians that were actually rendered this iteration.
+    # Previously this was a blanket +=1, which counted mapping iterations
+    # rather than observations. With min_observations=50 and 25 mapping
+    # iters/frame, the threshold was hit after ~2 frames regardless of
+    # whether a Gaussian was ever visible -> premature pruning.
+    variables["vis_frame_count"][:N] += (gauss_vis[:N] > 0).float()
 
     # Three-way classification (only when deformation is enabled)
     if innovation_config.get("enable_deformation", False):
@@ -447,10 +458,33 @@ def update_three_way_classifier(variables, gauss_vis, innovation_config):
 # Gradient-based densification (standard 3DGS)
 # ============================================================
 
+def _extend_innovation_vars_for_clone(variables, parent_mask):
+    """
+    Helper for FIX C: when densify clones Gaussians, copy the parent's
+    visibility history into the new rows so newly-created Gaussians
+    do not get zero-padded (which would cause them to be flagged as
+    floaters within ~min_observations frames). Also extend deform_mask
+    and prev_deform_offsets.
+    """
+    if "vis_history" in variables:
+        new_rows = variables["vis_history"][parent_mask]
+        variables["vis_history"] = torch.cat([variables["vis_history"], new_rows], dim=0)
+    if "vis_frame_count" in variables:
+        new_cnt = variables["vis_frame_count"][parent_mask]
+        variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
+    if "deform_mask" in variables:
+        new_mask = variables["deform_mask"][parent_mask]
+        variables["deform_mask"] = torch.cat([variables["deform_mask"], new_mask], dim=0)
+    if "prev_deform_offsets" in variables:
+        new_off = variables["prev_deform_offsets"][parent_mask]
+        variables["prev_deform_offsets"] = torch.cat([variables["prev_deform_offsets"], new_off], dim=0)
+    return variables
+
+
 def densify(params, variables, optimizer, iter, densify_dict):
     """
     Standard gradient-based densification: clone small Gaussians, split large ones.
-    
+
     Based on the original 3D Gaussian Splatting paper (Kerbl et al., 2023).
     """
     if iter <= densify_dict["stop_after"]:
@@ -468,6 +502,8 @@ def densify(params, variables, optimizer, iter, densify_dict):
             )
             new_params = {k: v[to_clone] for k, v in params.items() if k not in ["cam_unnorm_rots", "cam_trans"]}
             params = cat_params_to_optimizer(new_params, params, optimizer)
+            # FIX C: extend visibility/innovation buffers for cloned Gaussians
+            variables = _extend_innovation_vars_for_clone(variables, to_clone)
             num_pts = params["means3D"].shape[0]
 
             # Split: large Gaussians with large gradients
@@ -486,6 +522,10 @@ def densify(params, variables, optimizer, iter, densify_dict):
             new_params["means3D"] += torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
             new_params["log_scales"] = torch.log(torch.exp(new_params["log_scales"]) / (0.8 * n))
             params = cat_params_to_optimizer(new_params, params, optimizer)
+            # FIX C: extend visibility/innovation buffers for split Gaussians.
+            # Each split source produces n copies; replicate parent stats n times.
+            for _ in range(n):
+                variables = _extend_innovation_vars_for_clone(variables, to_split)
             num_pts = params["means3D"].shape[0]
 
             # Reset accumulators

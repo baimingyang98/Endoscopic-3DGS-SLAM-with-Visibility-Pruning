@@ -204,8 +204,15 @@ def initialize_optimizer(params, lrs_dict):
 
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
                                mean_sq_dist_method, densify_dataset=None,
-                               use_simplification=True):
-    """Initialize parameters from the first frame of the dataset."""
+                               use_simplification=True, enable_deformation=False):
+    """Initialize parameters from the first frame of the dataset.
+
+    Args:
+        enable_deformation: if True, allocates Innovation 3's per-Gaussian
+            position offsets. When False (default), deform_offsets is NOT
+            created so it cannot be silently picked up by transform_to_frame.
+            This was the source of the asymmetric mapping/tracking bug.
+    """
     color, depth, intrinsics, pose = dataset[0]
     color = color.permute(2, 0, 1) / 255
     depth = depth.permute(2, 0, 1)
@@ -243,10 +250,15 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
     params, variables = initialize_params(init_pt_cld, num_frames, mean3_sq_dist, use_simplification)
     variables["scene_radius"] = torch.max(depth) / scene_radius_depth_ratio
 
-    # Innovation 3: Initialize deformation offsets
-    params["deform_offsets"] = torch.nn.Parameter(
-        torch.zeros(params["means3D"].shape[0], 3, device="cuda").requires_grad_(True)
-    )
+    # Innovation 3: Initialize deformation offsets ONLY when enabled.
+    # Previously this was created unconditionally, which (combined with
+    # apply_deformation=True being passed unconditionally during mapping)
+    # caused tracking to render against means3D while mapping rendered
+    # against means3D + offset, producing systematic pose drift (ATE blowup).
+    if enable_deformation:
+        params["deform_offsets"] = torch.nn.Parameter(
+            torch.zeros(params["means3D"].shape[0], 3, device="cuda").requires_grad_(True)
+        )
 
     if densify_dataset is not None:
         return params, variables, intrinsics, w2c, cam, densify_intrinsics, densify_cam
@@ -270,26 +282,40 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights,
     """
     losses = {}
 
+    # Innovation 3 gating: only apply deformation when deform_offsets is
+    # actually a parameter AND a non-trivial deform_mask exists.
+    # CRITICAL: tracking and mapping must use the SAME geometry, otherwise
+    # systematic pose drift accumulates (was the cause of the ATE blowup).
+    apply_def = (
+        "deform_offsets" in params
+        and variables is not None
+        and "deform_mask" in variables
+        and variables["deform_mask"].any().item()
+    )
+    def_vars = variables if apply_def else None
+
     # Transform Gaussians to camera frame with appropriate gradients
     if tracking:
+        # Tracking: deformation MUST match what mapping uses (same geometry)
         transformed_pts = transform_to_frame(
-            params, iter_time_idx, gaussians_grad=False, camera_grad=True
+            params, iter_time_idx, gaussians_grad=False, camera_grad=True,
+            apply_deformation=apply_def, variables=def_vars,
         )
     elif mapping:
         if do_ba:
             transformed_pts = transform_to_frame(
                 params, iter_time_idx, gaussians_grad=True, camera_grad=True,
-                apply_deformation=True, variables=variables,
+                apply_deformation=apply_def, variables=def_vars,
             )
         else:
             transformed_pts = transform_to_frame(
                 params, iter_time_idx, gaussians_grad=True, camera_grad=False,
-                apply_deformation=True, variables=variables,
+                apply_deformation=apply_def, variables=def_vars,
             )
     else:
         transformed_pts = transform_to_frame(
             params, iter_time_idx, gaussians_grad=True, camera_grad=False,
-            apply_deformation=True, variables=variables,
+            apply_deformation=apply_def, variables=def_vars,
         )
 
     # Render RGB
@@ -440,15 +466,32 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx,
             params[k] = torch.nn.Parameter(torch.cat((params[k], v), dim=0).requires_grad_(True))
 
         num_pts = params["means3D"].shape[0]
+        n_new = new_pt_cld.shape[0]
         variables["means2D_gradient_accum"] = torch.zeros(num_pts, device="cuda").float()
         variables["denom"] = torch.zeros(num_pts, device="cuda").float()
         variables["max_2D_radius"] = torch.zeros(num_pts, device="cuda").float()
-        new_timestep = time_idx * torch.ones(new_pt_cld.shape[0], device="cuda").float()
+        new_timestep = time_idx * torch.ones(n_new, device="cuda").float()
         variables["timestep"] = torch.cat((variables["timestep"], new_timestep), dim=0)
+
+        # FIX C: extend visibility-buffer state for new Gaussians.
+        # Newly-added Gaussians have no observation history, so initialize
+        # them with zero visibility but ALSO start their frame_count at 0,
+        # so they are not eligible for visibility pruning until they have
+        # been observed for `min_observations` frames.
+        if "vis_history" in variables:
+            W_buf = variables["vis_history"].shape[1]
+            new_hist = torch.zeros(n_new, W_buf, device="cuda")
+            variables["vis_history"] = torch.cat([variables["vis_history"], new_hist], dim=0)
+        if "vis_frame_count" in variables:
+            new_cnt = torch.zeros(n_new, device="cuda")
+            variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
+        if "deform_mask" in variables:
+            new_dm = torch.zeros(n_new, dtype=torch.bool, device="cuda")
+            variables["deform_mask"] = torch.cat([variables["deform_mask"], new_dm], dim=0)
 
         # Innovation 3: Extend deformation offsets
         if "deform_offsets" in params:
-            new_deform = torch.zeros(new_pt_cld.shape[0], 3, device="cuda")
+            new_deform = torch.zeros(n_new, 3, device="cuda")
             params["deform_offsets"] = torch.nn.Parameter(
                 torch.cat((params["deform_offsets"], new_deform), dim=0).requires_grad_(True)
             )
@@ -717,12 +760,14 @@ def rgbd_slam(config: dict):
                 dataset, num_frames, config["scene_radius_depth_ratio"],
                 config["mean_sq_dist_method"], densify_dataset=densify_dataset,
                 use_simplification=config["gaussian_simplification"],
+                enable_deformation=config.get("innovations", {}).get("enable_deformation", False),
             )
     else:
         params, variables, intrinsics, first_frame_w2c, cam = initialize_first_timestep(
             dataset, num_frames, config["scene_radius_depth_ratio"],
             config["mean_sq_dist_method"],
             use_simplification=config["gaussian_simplification"],
+            enable_deformation=config.get("innovations", {}).get("enable_deformation", False),
         )
 
     # Tracking resolution dataset
@@ -1014,9 +1059,21 @@ def rgbd_slam(config: dict):
                 loss.backward()
 
                 with torch.no_grad():
+                    innovation_cfg = config.get("innovations", {})
+
+                    # Fix C: update visibility classifier BEFORE prune/densify
+                    # so vis_history stays index-aligned with the rasterizer's
+                    # gauss_vis from this iteration. If we update after
+                    # prune/densify, the Gaussian count has changed and rows
+                    # get mis-assigned (leading to newly-cloned Gaussians being
+                    # immediately mis-classified as floaters).
+                    if innovation_cfg.get("enable_visibility_pruning", False) and "gauss_vis" in variables:
+                        variables = update_three_way_classifier(
+                            variables, variables["gauss_vis"], innovation_cfg
+                        )
+
                     # Innovation 1: Enhanced pruning
                     if config["mapping"]["prune_gaussians"]:
-                        innovation_cfg = config.get("innovations", {})
                         prune_transformed_pts = None
                         if innovation_cfg.get("enable_visibility_pruning", False):
                             prune_transformed_pts = transform_to_frame(
@@ -1037,11 +1094,6 @@ def rgbd_slam(config: dict):
                     # Optimizer step
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-
-                    # Innovation 1+3: Update visibility classifier
-                    innovation_cfg = config.get("innovations", {})
-                    if innovation_cfg.get("enable_visibility_pruning", False) and "gauss_vis" in variables:
-                        variables = update_three_way_classifier(variables, variables["gauss_vis"], innovation_cfg)
 
                     # Innovation 3: Store previous deformation offsets
                     if innovation_cfg.get("enable_deformation", False) and "deform_offsets" in params:
