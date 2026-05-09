@@ -264,7 +264,8 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
     Returns:
         floater_mask: (N,) boolean tensor, True = floater
     """
-    gauss_depth = transformed_pts[:, 2].detach()
+    pts_cam = transformed_pts.detach()
+    gauss_depth = pts_cam[:, 2]
 
     intrinsics = curr_data["intrinsics"]
     FX = intrinsics[0, 0]
@@ -272,14 +273,21 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
     CX = intrinsics[0, 2]
     CY = intrinsics[1, 2]
 
-    pts_cam = transformed_pts.detach()
-    u = (FX * pts_cam[:, 0] / (pts_cam[:, 2] + 1e-6) + CX).long()
-    v = (FY * pts_cam[:, 1] / (pts_cam[:, 2] + 1e-6) + CY).long()
-
     H = curr_data["depth"].shape[1]
     W = curr_data["depth"].shape[2]
-    u = u.clamp(0, W - 1)
-    v = v.clamp(0, H - 1)
+
+    # FIX E: filter behind-camera and degenerate-depth Gaussians BEFORE
+    # the projection. With pts_cam[:, 2] <= 0, the perspective division
+    # flips sign and `.long()` can produce arbitrary integers; clamping
+    # them all to (0, 0) caused those Gaussians to be compared against
+    # the corner pixel's depth and frequently mis-flagged as floaters.
+    valid_proj = gauss_depth > 0.01
+
+    # Compute projection only where valid; for invalid Gaussians, fill
+    # with a dummy in-bounds index (0, 0) but they'll be masked out below.
+    safe_z = torch.where(valid_proj, gauss_depth, torch.ones_like(gauss_depth))
+    u = (FX * pts_cam[:, 0] / safe_z + CX).long().clamp(0, W - 1)
+    v = (FY * pts_cam[:, 1] / safe_z + CY).long().clamp(0, H - 1)
 
     gt_depth = curr_data["depth"].squeeze()  # (H, W)
     observed_depth = gt_depth[v, u]
@@ -288,10 +296,10 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
     depth_diff = observed_depth - gauss_depth
     floater_mask = depth_diff > gamma
 
-    # Only flag valid measurements
+    # Only flag valid measurements: positive observed depth, positive
+    # Gaussian depth, AND in-front-of-camera projection.
     valid_depth = observed_depth > 0
-    valid_gauss = gauss_depth > 0
-    floater_mask = floater_mask & valid_depth & valid_gauss
+    floater_mask = floater_mask & valid_depth & valid_proj
 
     return floater_mask
 
