@@ -489,47 +489,15 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                 N = params["means3D"].shape[0]
 
                 # --- Temporal floaters: low TVS + mature ---
-                if "vis_history" in variables and "vis_frame_count" in variables:
-                    tvs = compute_tvs(variables, params, innovation_config)
-                    frame_count = _resize_1d(variables["vis_frame_count"], N)
-                    temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
-
-                    # Apply Gumbel-Sigmoid soft degeneration ONLY to affected Gaussians.
-                    # Directly modify only the affected indices in logit_opacities.data
-                    # to avoid numerical drift from full sigmoid->inverse_sigmoid roundtrip.
-                    if temporal_floater.any():
-                        with torch.no_grad():
-                            decay = gumbel_sigmoid_decay(
-                                tvs[temporal_floater], tau_sig, temperature
-                            )
-                            # Compute new logit ONLY for affected Gaussians
-                            old_logit = params["logit_opacities"].data[temporal_floater].squeeze()
-                            old_opacity = torch.sigmoid(old_logit)
-                            new_opacity = (old_opacity * decay).clamp(1e-6, 1 - 1e-6)
-                            new_logit = torch.log(new_opacity / (1 - new_opacity))
-                            # Write back only the affected indices
-                            params["logit_opacities"].data[temporal_floater] = new_logit.unsqueeze(-1)
-                            # Reset optimizer state for affected indices only
-                            _reset_optimizer_state_subset(optimizer, "logit_opacities", temporal_floater)
+                # TVS degeneration is currently disabled for debugging.
+                # The buffer still accumulates (update_vis_buffer runs after tracking)
+                # but no opacity modification happens here.
+                # TODO: re-enable once baseline parity is confirmed with TVS flag on.
+                pass
 
                 # --- Spatial floaters: mild fixed decay ---
-                if (enable_spatial
-                        and curr_data is not None
-                        and transformed_pts is not None):
-                    gamma = innovation_config.get("distance_gamma", 0.5)
-                    spatial_floater = compute_distance_mask(
-                        transformed_pts, curr_data, gamma=gamma
-                    )
-                    if spatial_floater.any():
-                        with torch.no_grad():
-                            # Modify only affected indices
-                            old_logit = params["logit_opacities"].data[spatial_floater].squeeze()
-                            old_opacity = torch.sigmoid(old_logit)
-                            new_opacity = (old_opacity * eta_spatial).clamp(1e-6, 1 - 1e-6)
-                            new_logit = torch.log(new_opacity / (1 - new_opacity))
-                            params["logit_opacities"].data[spatial_floater] = new_logit.unsqueeze(-1)
-                            # Reset optimizer state for affected indices only
-                            _reset_optimizer_state_subset(optimizer, "logit_opacities", spatial_floater)
+                # Also disabled for debugging.
+                pass
 
             # === LEGACY: Old dual-mask pruning (for backward compat) ===
             elif (innovation_config is not None
