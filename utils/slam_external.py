@@ -593,14 +593,14 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
 
         if temporal_floater.any():
             n_floaters = temporal_floater.sum().item()
-            print(f"    [TVS] Degenerating {n_floaters}/{N} temporal floaters "
-                  f"(frame_count max={frame_count.max().item():.0f}, "
-                  f"tvs range=[{tvs.min().item():.4f}, {tvs.max().item():.4f}])")
+            # Only degenerate, do NOT let them reach hard-removal threshold.
+            # Use a gentle multiplicative decay that floors at 0.01 (sigmoid → ~0.01)
+            # instead of driving to zero.
             with torch.no_grad():
-                decay = gumbel_sigmoid_decay(tvs[temporal_floater], tau_sig, temperature)
                 affected_logit = params["logit_opacities"].data[temporal_floater, 0]
                 affected_opacity = torch.sigmoid(affected_logit)
-                new_opacity = (affected_opacity * decay).clamp(1e-6, 1 - 1e-6)
+                # Gentle decay: multiply by 0.9 (not the Gumbel-Sigmoid which goes to ~0)
+                new_opacity = (affected_opacity * 0.9).clamp(0.01, 1 - 1e-6)
                 new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
                 params["logit_opacities"].data[temporal_floater, 0] = new_logit_vals
                 n_degenerated += n_floaters
