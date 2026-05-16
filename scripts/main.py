@@ -36,7 +36,8 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion,
 )
 from utils.slam_external import (
-    calc_ssim, build_rotation, prune_gaussians, densify, update_three_way_classifier,
+    calc_ssim, build_rotation, prune_gaussians, densify,
+    update_three_way_classifier, update_vis_buffer,
 )
 from utils.vis_utils import plot_video
 
@@ -876,7 +877,31 @@ def rgbd_slam(config: dict):
 
         # Initialize camera pose
         if time_idx > 0:
-            params = initialize_camera_pose(params, time_idx, forward_prop=config["tracking"]["forward_prop"])
+            innovation_cfg = config.get("innovations", {})
+            flow_init_success = False
+
+            # Flow-guided pose initialization (if enabled and flow available)
+            if innovation_cfg.get("enable_flow_init", False) and time_idx >= 1:
+                flow_subdir = innovation_cfg.get("flow_dir", "flow")
+                flow_dir = os.path.join(config["data"]["basedir"], config["data"]["sequence"], flow_subdir)
+                flow_conf_thresh = innovation_cfg.get("flow_confidence_threshold", 0.5)
+
+                from utils.flow_utils import load_flow, flow_guided_pose_init
+                # Flow from frame (time_idx-1) -> time_idx
+                # Need to map SLAM frame index to dataset file index for train split
+                # In train split with stride=1, dataset indices skip every 8th frame
+                # For simplicity, use time_idx directly (works when data files are
+                # already the train-split subset, which is the case for C3VD)
+                flow_data = load_flow(flow_dir, time_idx - 1)
+                if flow_data is not None:
+                    params, flow_init_success = flow_guided_pose_init(
+                        params, time_idx, flow_data, depth, intrinsics,
+                        confidence_threshold=flow_conf_thresh,
+                    )
+
+            # Fallback to constant-velocity model if flow init failed or disabled
+            if not flow_init_success:
+                params = initialize_camera_pose(params, time_idx, forward_prop=config["tracking"]["forward_prop"])
 
         # ----------------------------------------------------
         # TRACKING
@@ -1056,26 +1081,52 @@ def rgbd_slam(config: dict):
                     config["mapping"]["ignore_outlier_depth_loss"],
                     mapping=True,
                 )
+
+                # Optical flow loss (if enabled and flow available for this keyframe)
+                innovation_cfg_map = config.get("innovations", {})
+                if innovation_cfg_map.get("enable_flow_loss", False) and iter_time_idx > 0:
+                    flow_subdir = innovation_cfg_map.get("flow_dir", "flow")
+                    flow_dir = os.path.join(
+                        config["data"]["basedir"], config["data"]["sequence"], flow_subdir
+                    )
+                    from utils.flow_utils import load_flow, compute_flow_loss
+                    # Flow from (iter_time_idx-1) -> iter_time_idx
+                    gt_flow = load_flow(flow_dir, iter_time_idx - 1)
+                    if gt_flow is not None:
+                        lambda_flow = innovation_cfg_map.get("lambda_flow", 0.1)
+                        flow_loss = compute_flow_loss(
+                            params, iter_time_idx - 1, iter_time_idx,
+                            gt_flow, cam, intrinsics,
+                        )
+                        loss = loss + lambda_flow * flow_loss
+
                 loss.backward()
 
                 with torch.no_grad():
                     innovation_cfg = config.get("innovations", {})
 
-                    # Fix C: update visibility classifier BEFORE prune/densify
-                    # so vis_history stays index-aligned with the rasterizer's
-                    # gauss_vis from this iteration. If we update after
-                    # prune/densify, the Gaussian count has changed and rows
-                    # get mis-assigned (leading to newly-cloned Gaussians being
-                    # immediately mis-classified as floaters).
-                    if innovation_cfg.get("enable_visibility_pruning", False) and "gauss_vis" in variables:
-                        variables = update_three_way_classifier(
-                            variables, variables["gauss_vis"], innovation_cfg
-                        )
+                    # Update visibility buffer BEFORE prune/densify so
+                    # vis_history stays index-aligned with the current
+                    # Gaussian set. Works for both TVS and legacy paths.
+                    if "gauss_vis" in variables:
+                        if innovation_cfg.get("enable_tvs_pruning", False):
+                            variables = update_vis_buffer(
+                                variables, variables["gauss_vis"], innovation_cfg
+                            )
+                        elif innovation_cfg.get("enable_visibility_pruning", False):
+                            variables = update_three_way_classifier(
+                                variables, variables["gauss_vis"], innovation_cfg
+                            )
 
-                    # Innovation 1: Enhanced pruning
+                    # Pruning (TVS-guided, legacy, or baseline)
                     if config["mapping"]["prune_gaussians"]:
                         prune_transformed_pts = None
-                        if innovation_cfg.get("enable_visibility_pruning", False):
+                        if (innovation_cfg.get("enable_tvs_pruning", False)
+                                and innovation_cfg.get("enable_spatial_mask", True)):
+                            prune_transformed_pts = transform_to_frame(
+                                params, iter_time_idx, gaussians_grad=False, camera_grad=False
+                            )
+                        elif innovation_cfg.get("enable_visibility_pruning", False):
                             prune_transformed_pts = transform_to_frame(
                                 params, iter_time_idx, gaussians_grad=False, camera_grad=False
                             )
@@ -1194,6 +1245,93 @@ def rgbd_slam(config: dict):
         f.write(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000:.2f} ms\n")
         f.write(f"Average Mapping/Frame Time: {mapping_frame_time_avg:.4f} s\n")
         f.write(f"Total Frame Time: {tracking_frame_time_avg + mapping_frame_time_avg:.4f} s\n")
+
+    # --------------------------------------------------------
+    # POST-SLAM REFINEMENT (if enabled)
+    # --------------------------------------------------------
+    innovation_cfg = config.get("innovations", {})
+    if innovation_cfg.get("enable_refinement", False) and len(keyframe_list) > 0:
+        print("\n=== Post-SLAM Refinement ===")
+        refine_stage1_iters = innovation_cfg.get("refine_stage1_iters", 100)
+        refine_stage2_iters = innovation_cfg.get("refine_stage2_iters", 500)
+        refine_lambda_dssim = innovation_cfg.get("refine_lambda_dssim", 0.2)
+
+        # Create optimizer for Gaussians only (no camera pose updates)
+        refine_lrs = {k: config["mapping"]["lrs"].get(k, 0.0) for k in params.keys()
+                      if k not in ["cam_unnorm_rots", "cam_trans"]}
+        refine_lrs["cam_unnorm_rots"] = 0.0
+        refine_lrs["cam_trans"] = 0.0
+
+        # Stage 1: Keyframe-priority refinement (worst-quality first)
+        print(f"  Stage 1: Refining {len(keyframe_list)} keyframes ({refine_stage1_iters} iters each)...")
+        # Compute current PSNR for each keyframe to rank them
+        keyframe_psnrs = []
+        with torch.no_grad():
+            for kf in keyframe_list:
+                kf_transformed = transform_to_frame(params, kf["id"], gaussians_grad=False, camera_grad=False)
+                kf_rendervar = transformed_params2rendervar(params, kf_transformed)
+                kf_out = Renderer(raster_settings=cam)(**kf_rendervar)
+                kf_im = kf_out[0]
+                kf_psnr = -10 * torch.log10(((kf_im - kf["color"]) ** 2).mean())
+                keyframe_psnrs.append(kf_psnr.item())
+
+        # Sort keyframes by PSNR (worst first)
+        sorted_kf_indices = np.argsort(keyframe_psnrs)
+
+        refine_optimizer = initialize_optimizer(params, refine_lrs)
+        from utils.slam_external import calc_ssim as refine_ssim
+        refine_bar = tqdm(range(len(keyframe_list) * refine_stage1_iters), desc="  Refine S1")
+
+        for kf_rank in sorted_kf_indices:
+            kf = keyframe_list[kf_rank]
+            kf_data = {"cam": cam, "im": kf["color"], "depth": kf["depth"],
+                       "id": kf["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
+            for _ in range(refine_stage1_iters):
+                loss_r, _, _ = get_loss(
+                    params, kf_data, variables, kf["id"],
+                    config["mapping"]["loss_weights"],
+                    config["mapping"]["use_sil_for_loss"],
+                    config["mapping"]["sil_thres"],
+                    config["mapping"]["use_l1"],
+                    config["mapping"]["ignore_outlier_depth_loss"],
+                    mapping=True,
+                )
+                # Add DSSIM term for structural preservation
+                kf_transformed = transform_to_frame(params, kf["id"], gaussians_grad=True, camera_grad=False)
+                kf_rendervar = transformed_params2rendervar(params, kf_transformed)
+                kf_out = Renderer(raster_settings=cam)(**kf_rendervar)
+                kf_im_r = kf_out[0]
+                dssim = 1.0 - refine_ssim(kf_im_r, kf["color"])
+                loss_r = (1 - refine_lambda_dssim) * loss_r + refine_lambda_dssim * dssim
+
+                loss_r.backward()
+                refine_optimizer.step()
+                refine_optimizer.zero_grad(set_to_none=True)
+                refine_bar.update(1)
+        refine_bar.close()
+
+        # Stage 2: Global random refinement
+        print(f"  Stage 2: Global random refinement ({refine_stage2_iters} iters)...")
+        refine_bar2 = tqdm(range(refine_stage2_iters), desc="  Refine S2")
+        for _ in range(refine_stage2_iters):
+            rand_kf = keyframe_list[np.random.randint(0, len(keyframe_list))]
+            kf_data = {"cam": cam, "im": rand_kf["color"], "depth": rand_kf["depth"],
+                       "id": rand_kf["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
+            loss_r, _, _ = get_loss(
+                params, kf_data, variables, rand_kf["id"],
+                config["mapping"]["loss_weights"],
+                config["mapping"]["use_sil_for_loss"],
+                config["mapping"]["sil_thres"],
+                config["mapping"]["use_l1"],
+                config["mapping"]["ignore_outlier_depth_loss"],
+                mapping=True,
+            )
+            loss_r.backward()
+            refine_optimizer.step()
+            refine_optimizer.zero_grad(set_to_none=True)
+            refine_bar2.update(1)
+        refine_bar2.close()
+        print("  Refinement complete.")
 
     # Final evaluation
     eval_ds = [dataset, eval_dataset, "C3VD"] if dataset_config["train_or_test"] == "train" else dataset

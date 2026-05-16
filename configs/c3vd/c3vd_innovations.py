@@ -1,8 +1,18 @@
 """
-Configuration for C3VD dataset with all three innovations.
+Configuration for C3VD dataset with TVS-Guided Soft Pruning + Optical Flow.
 
-Innovations can be toggled independently via the 'innovations' dict.
+Ablation system: each innovation is independently toggleable.
 Scene is selected via SCENE_NUM environment variable (default: sigmoid_t3_a).
+
+Ablation configs:
+  - Baseline parity:   all innovations OFF, gaussian_simplification=True, 15+25 iters
+  - A1 (TVS only):     enable_tvs_pruning=True, all others OFF
+  - A2 (TVS+spatial):  A1 + enable_spatial_mask=True
+  - A3 (Flow init):    enable_flow_init=True, all others OFF
+  - A4 (Flow loss):    enable_flow_loss=True, all others OFF
+  - A5 (Full 3DGS):    gaussian_simplification=False, all innovations OFF
+  - A6 (Refinement):   enable_refinement=True, all others OFF
+  - Full system:       everything ON, gaussian_simplification=False, 30+50 iters
 """
 import os
 
@@ -38,7 +48,7 @@ keyframe_every = 8
 tracking_iters = 30
 mapping_iters = 50
 
-group_name = "C3VD_innovations"
+group_name = "C3VD_tvs"
 run_name = scene_name
 
 config = dict(
@@ -51,7 +61,7 @@ config = dict(
     distance_keyframe_selection=True,
     distance_current_frame_prob=0.1,
     mapping_window_size=-1,
-    report_global_progress_every=2000,
+    report_global_progress_every=999999,
     scene_radius_depth_ratio=3,
     mean_sq_dist_method="projective",
     report_iter_progress=False,
@@ -59,7 +69,7 @@ config = dict(
     checkpoint_time_idx=0,
     save_checkpoints=False,
     checkpoint_interval=int(1e10),
-    gaussian_simplification=True,
+    gaussian_simplification=False,  # Full 3DGS: anisotropic scales + 3-degree SH
 
     # --------------------------------------------------------
     # Data configuration
@@ -88,10 +98,7 @@ config = dict(
         sil_thres=0.99,
         use_l1=True,
         ignore_outlier_depth_loss=False,
-        loss_weights=dict(
-            im=0.5,
-            depth=1.0,
-        ),
+        loss_weights=dict(im=0.5, depth=1.0),
         lrs=dict(
             means3D=0.0,
             rgb_colors=0.0,
@@ -113,18 +120,15 @@ config = dict(
         use_l1=True,
         use_sil_for_loss=False,
         ignore_outlier_depth_loss=False,
-        loss_weights=dict(
-            im=1.0,
-            depth=1.0,
-        ),
+        loss_weights=dict(im=1.0, depth=1.0),
         lrs=dict(
             means3D=0.0001,
             rgb_colors=0.0025,
             unnorm_rotations=0.001,
             logit_opacities=0.05,
             log_scales=0.001,
-            cam_unnorm_rots=0.000,
-            cam_trans=0.000,
+            cam_unnorm_rots=0.0,
+            cam_trans=0.0,
         ),
         prune_gaussians=True,
         pruning_dict=dict(
@@ -152,43 +156,37 @@ config = dict(
     ),
 
     # ============================================================
-    # INNOVATION CONFIG - Toggle each independently
-    # These values match the notebook's final cell-20 config that produced
-    # the published results: PSNR 22.46, RMSE 1.62, ATE 0.46 on sigmoid_t3_a.
+    # INNOVATIONS — All independently toggleable for ablation
     # ============================================================
     innovations=dict(
-        # --- Innovation 1: Visibility-aware dual-mask pruning ---
-        enable_visibility_pruning=True,
-        distance_gamma=0.5,           # Depth diff threshold for floater detection
-        degeneration_eta=0.9,         # Opacity degeneration factor (gentle 10% reduction)
-        vis_threshold=0.05,           # Min mean visibility to be considered valid
-        min_observations=50,          # Min frames before visibility pruning activates
-        vis_window_size=15,           # Circular buffer size for visibility history
+        # --- TVS-Guided Soft Pruning ---
+        enable_tvs_pruning=True,        # Master switch for TVS pruning
+        tvs_buffer_size=15,             # W: circular buffer size (frames)
+        tvs_beta=0.1,                   # Volume penalty exponent
+        tvs_tau_sig=0.05,               # Significance threshold (log-space)
+        tvs_temperature=0.02,           # Gumbel-Sigmoid sharpness
+        tvs_min_obs=50,                 # Maturation: min frames before eligible
+        eta_spatial=0.9,                # Spatial floater mild decay factor
+        enable_spatial_mask=True,       # Toggle spatial floater detection
+        distance_gamma=0.5,             # Depth diff threshold for spatial mask
 
-        # --- Innovation 2: Periodic Bundle Adjustment ---
-        enable_periodic_ba=True,
-        ba_every_m_frames=50,         # BA trigger frequency (frames)
-        ba_n_keyframes=5,             # Number of keyframes per BA session
-        ba_num_iters=20,              # BA optimization iterations per session
-        ba_selection="hybrid",        # Keyframe selection: 'uniform', 'recent', 'hybrid'
-        ba_lrs=dict(
-            means3D=0.00002,
-            rgb_colors=0.0005,
-            unnorm_rotations=0.0002,
-            logit_opacities=0.01,
-            log_scales=0.0002,
-            cam_unnorm_rots=0.0005,   # Non-zero: camera poses get gradients during BA
-            cam_trans=0.001,
-        ),
+        # --- Optical Flow ---
+        enable_flow_init=True,          # Flow-guided pose initialization
+        enable_flow_loss=True,          # L_flow in mapping
+        lambda_flow=0.1,                # Weight for flow loss
+        flow_dir="flow",                # Subdirectory under scene folder
+        flow_confidence_threshold=0.5,  # Min confidence to use flow init
 
-        # --- Innovation 3: Deformation modeling (experimental) ---
-        # Disabled for C3VD (rigid scenes); enable on StereoMIS for deformation
+        # --- Post-SLAM Refinement ---
+        enable_refinement=True,         # Two-stage post-SLAM refinement
+        refine_stage1_iters=100,        # Iters per keyframe (worst-first)
+        refine_stage2_iters=500,        # Global random iters
+        refine_lambda_dssim=0.2,        # DSSIM weight in refinement loss
+
+        # --- Legacy flags (disabled, kept for backward compat) ---
+        enable_visibility_pruning=False,
+        enable_periodic_ba=False,
         enable_deformation=False,
-        deform_lr=0.0005,
-        var_threshold=0.1,            # Visibility variance threshold for deformation
-        lambda_deform_temporal=0.1,
-        lambda_deform_magnitude=0.01,
-        enable_deform_weighted_tracking=False,
     ),
 
     # --------------------------------------------------------

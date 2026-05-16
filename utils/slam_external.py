@@ -250,24 +250,94 @@ def inverse_sigmoid(x):
 
 
 # ============================================================
-# INNOVATION 1: Distance-based floater detection
+# TVS-GUIDED SOFT PRUNING: Core computation
+# ============================================================
+
+def compute_tvs(variables, params, innovation_config):
+    """
+    Compute the Temporal-Volumetric Significance (TVS) score for all Gaussians.
+
+    TVS_j = mean(V_buffer[j, 0:W]) * gamma(Sigma_j)
+    gamma(Sigma_j) = (V_norm_j)^beta
+    V(Sigma_j) = (4/3) * pi * s_x * s_y * s_z  (anisotropic volume)
+
+    Args:
+        variables: dict with 'vis_history' (N, W) circular buffer
+        params: Gaussian parameters (needs 'log_scales')
+        innovation_config: dict with 'tvs_beta'
+
+    Returns:
+        tvs: (N,) Temporal-Volumetric Significance score
+    """
+    beta = innovation_config.get("tvs_beta", 0.1)
+
+    # Temporal mean visibility from circular buffer
+    vis_hist = variables["vis_history"]  # (N, W)
+    vis_mean = vis_hist.mean(dim=1)  # (N,)
+
+    # Volumetric penalty: penalize large Gaussians that contribute little
+    log_scales = params["log_scales"]
+    if log_scales.shape[1] == 1:
+        # Isotropic: volume = (4/3) * pi * s^3
+        s = torch.exp(log_scales.squeeze())
+        volume = (4.0 / 3.0) * 3.14159 * s ** 3
+    else:
+        # Anisotropic: volume = (4/3) * pi * s_x * s_y * s_z
+        scales = torch.exp(log_scales)  # (N, 3)
+        volume = (4.0 / 3.0) * 3.14159 * scales[:, 0] * scales[:, 1] * scales[:, 2]
+
+    # Normalize volume and apply power penalty
+    v_max = volume.max().clamp(min=1e-10)
+    v_norm = volume / v_max
+    gamma = v_norm ** beta  # (N,) in [0, 1]
+
+    tvs = vis_mean * gamma
+    return tvs
+
+
+def gumbel_sigmoid_decay(tvs, tau_sig, temperature):
+    """
+    Compute Gumbel-Sigmoid soft degeneration factor.
+
+    gs(TVS) = 1 / (1 + exp(-(log(TVS) - tau_sig) / temperature))
+
+    When TVS is high -> decay_factor -> 1 (keep)
+    When TVS is low  -> decay_factor -> 0 (degenerate)
+
+    Args:
+        tvs: (M,) TVS scores for floater Gaussians
+        tau_sig: significance threshold (log-space)
+        temperature: sharpness of transition
+
+    Returns:
+        decay_factor: (M,) in (0, 1)
+    """
+    # Clamp TVS to avoid log(0)
+    safe_tvs = tvs.clamp(min=1e-10)
+    logit = (torch.log(safe_tvs) - tau_sig) / temperature
+    decay_factor = torch.sigmoid(logit)
+    return decay_factor
+
+
+# ============================================================
+# TVS-GUIDED SOFT PRUNING: Spatial floater detection
 # ============================================================
 
 def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
     """
-    Detect Gaussians floating in front of the observed surface (GS-SLAM Eq. 9).
-    
+    Detect Gaussians floating in front of the observed surface.
+
     Projects each Gaussian onto the image plane and compares its depth to the
     observed depth at that pixel. Gaussians significantly in front of the
-    surface are flagged as floaters.
-    
+    surface are flagged as spatial floaters.
+
     Args:
         transformed_pts: (N, 3) Gaussian positions in camera frame
         curr_data: dict with 'depth' (1, H, W) and 'intrinsics' (3, 3)
         gamma: depth difference threshold
-    
+
     Returns:
-        floater_mask: (N,) boolean tensor, True = floater
+        floater_mask: (N,) boolean tensor, True = spatial floater
     """
     pts_cam = transformed_pts.detach()
     gauss_depth = pts_cam[:, 2]
@@ -281,15 +351,8 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
     H = curr_data["depth"].shape[1]
     W = curr_data["depth"].shape[2]
 
-    # FIX E: filter behind-camera and degenerate-depth Gaussians BEFORE
-    # the projection. With pts_cam[:, 2] <= 0, the perspective division
-    # flips sign and `.long()` can produce arbitrary integers; clamping
-    # them all to (0, 0) caused those Gaussians to be compared against
-    # the corner pixel's depth and frequently mis-flagged as floaters.
+    # Filter behind-camera Gaussians before projection
     valid_proj = gauss_depth > 0.01
-
-    # Compute projection only where valid; for invalid Gaussians, fill
-    # with a dummy in-bounds index (0, 0) but they'll be masked out below.
     safe_z = torch.where(valid_proj, gauss_depth, torch.ones_like(gauss_depth))
     u = (FX * pts_cam[:, 0] / safe_z + CX).long().clamp(0, W - 1)
     v = (FY * pts_cam[:, 1] / safe_z + CY).long().clamp(0, H - 1)
@@ -301,8 +364,7 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
     depth_diff = observed_depth - gauss_depth
     floater_mask = depth_diff > gamma
 
-    # Only flag valid measurements: positive observed depth, positive
-    # Gaussian depth, AND in-front-of-camera projection.
+    # Only flag valid measurements
     valid_depth = observed_depth > 0
     floater_mask = floater_mask & valid_depth & valid_proj
 
@@ -310,30 +372,74 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
 
 
 # ============================================================
-# INNOVATION 1: Enhanced pruning with dual-mask
+# TVS-GUIDED SOFT PRUNING: Visibility buffer update
+# ============================================================
+
+def update_vis_buffer(variables, gauss_vis, innovation_config):
+    """
+    Update the per-Gaussian visibility circular buffer.
+
+    Called every mapping iteration to record the latest gauss_vis from
+    the CUDA rasterizer into the rolling buffer.
+
+    Args:
+        variables: dict (modified in-place)
+        gauss_vis: (N,) per-Gaussian visibility from rasterizer
+        innovation_config: dict with 'tvs_buffer_size'
+
+    Returns:
+        variables: updated with new visibility data
+    """
+    N = gauss_vis.shape[0]
+    W = innovation_config.get("tvs_buffer_size", 15)
+
+    # Initialize circular buffer if needed
+    if "vis_history" not in variables:
+        variables["vis_history"] = torch.zeros(N, W, device="cuda")
+        variables["vis_frame_count"] = torch.zeros(N, device="cuda")
+        variables["vis_write_idx"] = 0
+
+    # Resize to match current Gaussian count (after densification)
+    variables["vis_history"] = _resize_to_N(variables["vis_history"], N)
+    variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)
+
+    # Write current visibility into circular buffer
+    col = variables["vis_write_idx"] % W
+    variables["vis_history"][:N, col] = gauss_vis[:N].detach()
+    variables["vis_write_idx"] = (variables["vis_write_idx"] + 1) % W
+
+    # Count only Gaussians that were actually rendered (gauss_vis > 0)
+    variables["vis_frame_count"][:N] += (gauss_vis[:N] > 0).float()
+
+    return variables
+
+
+# ============================================================
+# TVS-GUIDED SOFT PRUNING: Main pruning function
 # ============================================================
 
 def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                     innovation_config=None, curr_data=None, transformed_pts=None):
     """
-    Enhanced Gaussian pruning with visibility-aware dual-mask.
-    
-    Combines two signals for floater detection:
-    - Distance mask: Gaussian sits in front of observed surface
-    - Visibility mask: Gaussian has low mean visibility over recent frames
-    
-    Floaters undergo opacity degeneration (multiply by eta) rather than
-    immediate removal. The standard opacity threshold then handles cleanup.
-    
-    Falls back to original opacity-only pruning when innovation_config is None.
-    
+    Gaussian pruning with TVS-Guided Soft Pruning (when enabled) or
+    standard opacity-only pruning (baseline fallback).
+
+    TVS-Guided Soft Pruning:
+    - Temporal floaters (low TVS + mature) -> Gumbel-Sigmoid degeneration
+    - Spatial floaters (in front of surface) -> mild fixed decay
+    - Hard removal: sigmoid(opacity) < threshold
+
+    Ablation flags:
+    - enable_tvs_pruning: master switch for TVS pruning
+    - enable_spatial_mask: toggle spatial floater detection independently
+
     Args:
         params: Gaussian parameters
-        variables: state variables (vis_history, etc.)
+        variables: state variables (vis_history, vis_frame_count, etc.)
         optimizer: Adam optimizer
         iter: current mapping iteration
-        prune_dict: pruning hyperparameters
-        innovation_config: innovation settings (None = disabled)
+        prune_dict: pruning hyperparameters (start_after, stop_after, etc.)
+        innovation_config: innovation settings (None = baseline behavior)
         curr_data: current frame data (for distance mask)
         transformed_pts: (N, 3) Gaussians in camera frame (for distance mask)
     """
@@ -344,23 +450,67 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
             else:
                 remove_threshold = prune_dict["removal_opacity_threshold"]
 
-            # === INNOVATION 1: Dual-mask opacity degeneration ===
+            # === TVS-GUIDED SOFT PRUNING ===
             if (innovation_config is not None
+                    and innovation_config.get("enable_tvs_pruning", False)):
+
+                tau_sig = innovation_config.get("tvs_tau_sig", 0.05)
+                temperature = innovation_config.get("tvs_temperature", 0.02)
+                min_obs = innovation_config.get("tvs_min_obs", 50)
+                eta_spatial = innovation_config.get("eta_spatial", 0.9)
+                enable_spatial = innovation_config.get("enable_spatial_mask", True)
+
+                N = params["means3D"].shape[0]
+
+                # --- Temporal floaters: low TVS + mature ---
+                if "vis_history" in variables and "vis_frame_count" in variables:
+                    tvs = compute_tvs(variables, params, innovation_config)
+                    frame_count = _resize_1d(variables["vis_frame_count"], N)
+                    temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
+
+                    # Apply Gumbel-Sigmoid soft degeneration
+                    if temporal_floater.any():
+                        with torch.no_grad():
+                            decay = gumbel_sigmoid_decay(
+                                tvs[temporal_floater], tau_sig, temperature
+                            )
+                            opacities = torch.sigmoid(params["logit_opacities"].squeeze())
+                            opacities[temporal_floater] = opacities[temporal_floater] * decay
+                            opacities = opacities.clamp(1e-6, 1 - 1e-6)
+                            new_logit = torch.log(opacities / (1 - opacities)).unsqueeze(-1)
+                            new_params = {"logit_opacities": new_logit}
+                            params = update_params_and_optimizer(new_params, params, optimizer)
+
+                # --- Spatial floaters: mild fixed decay ---
+                if (enable_spatial
+                        and curr_data is not None
+                        and transformed_pts is not None):
+                    gamma = innovation_config.get("distance_gamma", 0.5)
+                    spatial_floater = compute_distance_mask(
+                        transformed_pts, curr_data, gamma=gamma
+                    )
+                    if spatial_floater.any():
+                        with torch.no_grad():
+                            opacities = torch.sigmoid(params["logit_opacities"].squeeze())
+                            opacities[spatial_floater] = opacities[spatial_floater] * eta_spatial
+                            opacities = opacities.clamp(1e-6, 1 - 1e-6)
+                            new_logit = torch.log(opacities / (1 - opacities)).unsqueeze(-1)
+                            new_params = {"logit_opacities": new_logit}
+                            params = update_params_and_optimizer(new_params, params, optimizer)
+
+            # === LEGACY: Old dual-mask pruning (for backward compat) ===
+            elif (innovation_config is not None
                     and innovation_config.get("enable_visibility_pruning", False)
                     and curr_data is not None
                     and transformed_pts is not None):
 
                 gamma = innovation_config.get("distance_gamma", 0.5)
                 eta = innovation_config.get("degeneration_eta", 0.9)
-
-                # Distance-based floater detection
                 floater_mask = compute_distance_mask(transformed_pts, curr_data, gamma=gamma)
 
-                # Visibility-based floater detection
                 if "vis_history" in variables and "vis_frame_count" in variables:
                     vis_threshold = innovation_config.get("vis_threshold", 0.05)
                     min_obs = innovation_config.get("min_observations", 50)
-
                     N = floater_mask.shape[0]
                     vis_hist = _resize_to_N(variables["vis_history"], N)
                     vis_cnt = _resize_1d(variables["vis_frame_count"], N)
@@ -368,17 +518,10 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                     low_vis = vis_mean < vis_threshold
                     enough_obs = vis_cnt > min_obs
                     vis_floater_mask = low_vis & enough_obs
-                    # Combined: distance OR visibility
                     combined_floater = floater_mask | vis_floater_mask
                 else:
                     combined_floater = floater_mask
 
-                # Degenerate opacity of floaters (gradual, not hard delete).
-                # FIX B: route this through update_params_and_optimizer() so
-                # Adam's exp_avg / exp_avg_sq are CLEARED for the rewritten
-                # tensor. Direct .data.copy_() left the old momentum stale,
-                # which made opacities oscillate wildly around the prune
-                # threshold across iterations.
                 with torch.no_grad():
                     if combined_floater.any():
                         opacities = torch.sigmoid(params["logit_opacities"].squeeze())
@@ -388,7 +531,7 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                         new_params = {"logit_opacities": new_logit}
                         params = update_params_and_optimizer(new_params, params, optimizer)
 
-            # Standard opacity-based removal
+            # Standard opacity-based hard removal (always runs)
             to_remove = (torch.sigmoid(params["logit_opacities"]) < remove_threshold).squeeze()
             # Scale-based removal
             if iter >= prune_dict["remove_big_after"]:
@@ -406,51 +549,31 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
 
 
 # ============================================================
-# INNOVATION 1+3: Three-way visibility classifier
+# LEGACY: Three-way visibility classifier (kept for backward compat)
 # ============================================================
 
 def update_three_way_classifier(variables, gauss_vis, innovation_config):
     """
-    Update per-Gaussian visibility history buffer and classify Gaussians.
-    
-    Classification:
-    - STATIC: consistently visible, low variance
-    - DEFORMING: visible but inconsistent (high variance) -> gets deformation offsets
-    - FLOATER: consistently low visibility -> candidate for pruning
-    
-    Args:
-        variables: dict with vis_history, vis_frame_count, vis_write_idx
-        gauss_vis: (N,) per-Gaussian visibility from CUDA rasterizer
-        innovation_config: dict with threshold settings
-    
-    Returns:
-        variables: updated with new visibility data and deform_mask
+    Legacy function: Update per-Gaussian visibility history buffer.
+    Replaced by update_vis_buffer() in the new TVS system.
+    Kept for backward compatibility with old configs using enable_visibility_pruning.
     """
     N = gauss_vis.shape[0]
     W = innovation_config.get("vis_window_size", 15)
 
-    # Initialize circular buffer if needed
     if "vis_history" not in variables:
         variables["vis_history"] = torch.zeros(N, W, device="cuda")
         variables["vis_frame_count"] = torch.zeros(N, device="cuda")
         variables["vis_write_idx"] = 0
 
-    # Resize to match current Gaussian count
     variables["vis_history"] = _resize_to_N(variables["vis_history"], N)
     variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)
 
-    # Write current visibility into circular buffer
     col = variables["vis_write_idx"] % W
     variables["vis_history"][:N, col] = gauss_vis[:N].detach()
     variables["vis_write_idx"] = (variables["vis_write_idx"] + 1) % W
-    # FIX D: count only Gaussians that were actually rendered this iteration.
-    # Previously this was a blanket +=1, which counted mapping iterations
-    # rather than observations. With min_observations=50 and 25 mapping
-    # iters/frame, the threshold was hit after ~2 frames regardless of
-    # whether a Gaussian was ever visible -> premature pruning.
     variables["vis_frame_count"][:N] += (gauss_vis[:N] > 0).float()
 
-    # Three-way classification (only when deformation is enabled)
     if innovation_config.get("enable_deformation", False):
         vis_threshold = innovation_config.get("vis_threshold", 0.05)
         var_threshold = innovation_config.get("var_threshold", 0.1)
@@ -459,8 +582,6 @@ def update_three_way_classifier(variables, gauss_vis, innovation_config):
         vis_mean = variables["vis_history"][:N].mean(dim=1)
         vis_var = variables["vis_history"][:N].var(dim=1)
         enough_obs = variables["vis_frame_count"][:N] > min_obs
-
-        # Deforming: visible but inconsistent across frames
         deform_mask = (vis_var > var_threshold) & (vis_mean > vis_threshold) & enough_obs
         variables["deform_mask"] = deform_mask
 
