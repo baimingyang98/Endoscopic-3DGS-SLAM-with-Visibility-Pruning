@@ -488,15 +488,9 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
 
                 N = params["means3D"].shape[0]
 
-                # --- Temporal floaters: low TVS + mature ---
-                # TVS degeneration is currently disabled for debugging.
-                # The buffer still accumulates (update_vis_buffer runs after tracking)
-                # but no opacity modification happens here.
-                # TODO: re-enable once baseline parity is confirmed with TVS flag on.
-                pass
-
-                # --- Spatial floaters: mild fixed decay ---
-                # Also disabled for debugging.
+                # --- TVS degeneration is applied BETWEEN frames, not during mapping ---
+                # (see tvs_degenerate_between_frames() called from main.py after mapping)
+                # This avoids corrupting optimizer state within the mapping session.
                 pass
 
             # === LEGACY: Old dual-mask pruning (for backward compat) ===
@@ -547,6 +541,80 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
             params = update_params_and_optimizer(new_params, params, optimizer)
 
     return params, variables
+
+
+# ============================================================
+# TVS-GUIDED SOFT PRUNING: Between-frame degeneration
+# ============================================================
+
+def tvs_degenerate_between_frames(params, variables, innovation_config, curr_data=None, transformed_pts=None):
+    """
+    Apply TVS-guided opacity degeneration BETWEEN frames (after mapping completes).
+
+    This is called AFTER the mapping optimizer is discarded, so modifying
+    logit_opacities has no interaction with Adam state. The next frame will
+    create a fresh optimizer that sees the degenerated values as its starting point.
+
+    Args:
+        params: Gaussian parameters (modified in-place)
+        variables: state variables with vis_history, vis_frame_count
+        innovation_config: dict with TVS hyperparameters
+        curr_data: current frame data (for spatial mask, optional)
+        transformed_pts: (N, 3) Gaussians in camera frame (for spatial mask, optional)
+
+    Returns:
+        params: with degenerated opacities
+        n_degenerated: number of Gaussians that had opacity reduced
+    """
+    tau_sig = innovation_config.get("tvs_tau_sig", 0.05)
+    temperature = innovation_config.get("tvs_temperature", 0.02)
+    min_obs = innovation_config.get("tvs_min_obs", 50)
+    eta_spatial = innovation_config.get("eta_spatial", 0.9)
+    enable_spatial = innovation_config.get("enable_spatial_mask", True)
+
+    N = params["means3D"].shape[0]
+    n_degenerated = 0
+
+    # --- Temporal floaters: low TVS + mature ---
+    if "vis_history" in variables and "vis_frame_count" in variables:
+        tvs = compute_tvs(variables, params, innovation_config)
+        frame_count = _resize_1d(variables["vis_frame_count"], N)
+        temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
+
+        if temporal_floater.any():
+            with torch.no_grad():
+                decay = gumbel_sigmoid_decay(tvs[temporal_floater], tau_sig, temperature)
+                affected_logit = params["logit_opacities"].data[temporal_floater, 0]
+                affected_opacity = torch.sigmoid(affected_logit)
+                new_opacity = (affected_opacity * decay).clamp(1e-6, 1 - 1e-6)
+                new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
+                params["logit_opacities"].data[temporal_floater, 0] = new_logit_vals
+                n_degenerated += temporal_floater.sum().item()
+
+    # --- Spatial floaters: mild fixed decay ---
+    if (enable_spatial and curr_data is not None and transformed_pts is not None):
+        gamma = innovation_config.get("distance_gamma", 0.5)
+        spatial_floater = compute_distance_mask(transformed_pts, curr_data, gamma=gamma)
+        if spatial_floater.any():
+            with torch.no_grad():
+                affected_logit = params["logit_opacities"].data[spatial_floater, 0]
+                affected_opacity = torch.sigmoid(affected_logit)
+                new_opacity = (affected_opacity * eta_spatial).clamp(1e-6, 1 - 1e-6)
+                new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
+                params["logit_opacities"].data[spatial_floater, 0] = new_logit_vals
+                n_degenerated += spatial_floater.sum().item()
+
+    # --- Hard removal of dead Gaussians (opacity below threshold) ---
+    # This runs without an optimizer, so we just filter params directly
+    removal_threshold = 0.005
+    to_remove = (torch.sigmoid(params["logit_opacities"]) < removal_threshold).squeeze()
+    if to_remove.any():
+        # Can't use remove_points here (needs optimizer). Just mark for removal
+        # on next frame's mapping prune step. The standard prune at iter=0 will
+        # catch these on the next frame.
+        pass
+
+    return params, n_degenerated
 
 
 # ============================================================

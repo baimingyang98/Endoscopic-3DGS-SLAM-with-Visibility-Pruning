@@ -38,6 +38,7 @@ from utils.slam_helpers import (
 from utils.slam_external import (
     calc_ssim, build_rotation, prune_gaussians, densify,
     update_three_way_classifier, update_vis_buffer,
+    tvs_degenerate_between_frames,
 )
 from utils.vis_utils import plot_video
 
@@ -1181,6 +1182,22 @@ def rgbd_slam(config: dict):
 
             mapping_frame_time_sum += time.time() - mapping_start_time
             mapping_frame_time_count += 1
+
+            # TVS-Guided Soft Pruning: degenerate BETWEEN frames
+            # (after mapping optimizer is done — no optimizer state corruption)
+            innovation_cfg = config.get("innovations", {})
+            if innovation_cfg.get("enable_tvs_pruning", False):
+                from utils.slam_external import tvs_degenerate_between_frames
+                # Get transformed pts for spatial mask (if enabled)
+                degen_pts = None
+                if innovation_cfg.get("enable_spatial_mask", True):
+                    degen_pts = transform_to_frame(
+                        params, time_idx, gaussians_grad=False, camera_grad=False
+                    )
+                params, n_degen = tvs_degenerate_between_frames(
+                    params, variables, innovation_cfg,
+                    curr_data=curr_data, transformed_pts=degen_pts,
+                )
 
             # Innovation 2: Periodic Bundle Adjustment
             innovation_cfg = config.get("innovations", {})
