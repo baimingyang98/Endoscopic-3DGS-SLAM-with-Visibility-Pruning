@@ -287,9 +287,11 @@ def compute_tvs(variables, params, innovation_config):
         volume = (4.0 / 3.0) * 3.14159 * scales[:, 0] * scales[:, 1] * scales[:, 2]
 
     # Normalize volume and apply power penalty
+    # Large volume -> high v_norm -> LOW gamma -> LOW TVS -> more likely pruned
+    # Small volume -> low v_norm -> HIGH gamma -> HIGH TVS -> protected
     v_max = volume.max().clamp(min=1e-10)
     v_norm = volume / v_max
-    gamma = v_norm ** beta  # (N,) in [0, 1]
+    gamma = (1.0 - v_norm).clamp(min=0.01) ** beta  # (N,) in (0, 1]
 
     tvs = vis_mean * gamma
     return tvs

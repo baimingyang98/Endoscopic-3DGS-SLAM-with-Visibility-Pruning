@@ -888,14 +888,21 @@ def rgbd_slam(config: dict):
 
                 from utils.flow_utils import load_flow, flow_guided_pose_init
                 # Flow from frame (time_idx-1) -> time_idx
-                # Need to map SLAM frame index to dataset file index for train split
-                # In train split with stride=1, dataset indices skip every 8th frame
-                # For simplicity, use time_idx directly (works when data files are
-                # already the train-split subset, which is the case for C3VD)
-                flow_data = load_flow(flow_dir, time_idx - 1)
+                # C3VD train split: color files are indexed 0..N (skipping every 8th).
+                # Flow was precomputed on full sequence files. We need to map SLAM's
+                # train-split index to the actual file index in the full sequence.
+                # Train frame at SLAM index i corresponds to full-sequence index:
+                #   full_idx = i + (i // 7)  [every 7 train frames, one test frame was skipped]
+                # For flow: we need the flow between full_idx(time_idx-1) and full_idx(time_idx)
+                full_idx_prev = (time_idx - 1) + ((time_idx - 1) // 7)
+                flow_data = load_flow(flow_dir, full_idx_prev)
                 if flow_data is not None:
+                    # BUG FIX: flow_guided_pose_init needs PREVIOUS frame's depth
+                    # (frame t-1), not current frame's depth. Load it from dataset.
+                    _, prev_depth_raw, _, _ = dataset[time_idx - 1]
+                    prev_depth = prev_depth_raw.permute(2, 0, 1)
                     params, flow_init_success = flow_guided_pose_init(
-                        params, time_idx, flow_data, depth, intrinsics,
+                        params, time_idx, flow_data, prev_depth, intrinsics,
                         confidence_threshold=flow_conf_thresh,
                     )
 
@@ -1082,20 +1089,25 @@ def rgbd_slam(config: dict):
                     mapping=True,
                 )
 
-                # Optical flow loss (if enabled and flow available for this keyframe)
+                # Optical flow loss (only for current frame — its pose is freshly
+                # tracked and reliable. Historical keyframes may have stale poses
+                # that would inject noise into Gaussian positions via flow gradients.)
                 innovation_cfg_map = config.get("innovations", {})
-                if innovation_cfg_map.get("enable_flow_loss", False) and iter_time_idx > 0:
+                if (innovation_cfg_map.get("enable_flow_loss", False)
+                        and iter_time_idx == time_idx
+                        and time_idx > 0):
                     flow_subdir = innovation_cfg_map.get("flow_dir", "flow")
                     flow_dir = os.path.join(
                         config["data"]["basedir"], config["data"]["sequence"], flow_subdir
                     )
                     from utils.flow_utils import load_flow, compute_flow_loss
-                    # Flow from (iter_time_idx-1) -> iter_time_idx
-                    gt_flow = load_flow(flow_dir, iter_time_idx - 1)
+                    # Map train-split index to full-sequence file index for flow lookup
+                    full_idx_prev = (time_idx - 1) + ((time_idx - 1) // 7)
+                    gt_flow = load_flow(flow_dir, full_idx_prev)
                     if gt_flow is not None:
                         lambda_flow = innovation_cfg_map.get("lambda_flow", 0.1)
                         flow_loss = compute_flow_loss(
-                            params, iter_time_idx - 1, iter_time_idx,
+                            params, time_idx - 1, time_idx,
                             gt_flow, cam, intrinsics,
                         )
                         loss = loss + lambda_flow * flow_loss
