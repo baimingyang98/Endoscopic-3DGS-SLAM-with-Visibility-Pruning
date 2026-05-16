@@ -162,6 +162,7 @@ config = dict(
         # --- TVS-Guided Soft Pruning ---
         enable_tvs_pruning=True,        # Master switch for TVS pruning
         tvs_buffer_size=15,             # W: circular buffer size (frames)
+        tvs_opacity_floor=0.01,         # Min opacity after degeneration (prevents hard removal)
         tvs_beta=0.1,                   # Volume penalty exponent
         tvs_tau_sig=0.05,               # Significance threshold (log-space)
         tvs_temperature=0.02,           # Gumbel-Sigmoid sharpness

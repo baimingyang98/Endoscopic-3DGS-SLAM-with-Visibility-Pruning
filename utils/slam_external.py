@@ -571,16 +571,10 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     min_obs = innovation_config.get("tvs_min_obs", 50)
     eta_spatial = innovation_config.get("eta_spatial", 0.9)
     enable_spatial = innovation_config.get("enable_spatial_mask", True)
-
-    # Debug: print first 5 calls to verify function behavior
-    if not hasattr(tvs_degenerate_between_frames, "_call_count"):
-        tvs_degenerate_between_frames._call_count = 0
-    tvs_degenerate_between_frames._call_count += 1
-    if tvs_degenerate_between_frames._call_count <= 5:
-        has_hist = "vis_history" in variables
-        print(f"  [TVS-DEBUG] call #{tvs_degenerate_between_frames._call_count}: "
-              f"N={params['means3D'].shape[0]}, has_vis_hist={has_hist}, "
-              f"min_obs={min_obs}, enable_spatial={enable_spatial}")
+    # Opacity floor: never let degenerated Gaussians fall below this.
+    # This prevents hard removal (threshold=0.005) from permanently deleting
+    # Gaussians that may be needed from other viewpoints.
+    opacity_floor = innovation_config.get("tvs_opacity_floor", 0.01)
 
     N = params["means3D"].shape[0]
     n_degenerated = 0
@@ -593,14 +587,17 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
 
         if temporal_floater.any():
             n_floaters = temporal_floater.sum().item()
-            # Only degenerate, do NOT let them reach hard-removal threshold.
-            # Use a gentle multiplicative decay that floors at 0.01 (sigmoid → ~0.01)
-            # instead of driving to zero.
             with torch.no_grad():
+                # Gumbel-Sigmoid decay clamped by opacity_floor to prevent
+                # hard removal. Gaussians decay toward the floor but never
+                # cross the hard-removal threshold (0.005), allowing recovery
+                # if they become visible from future viewpoints.
+                decay = gumbel_sigmoid_decay(tvs[temporal_floater], tau_sig, temperature)
+                # Clamp decay to ensure opacity doesn't go below floor
+                # decay_factor in [floor/current_opacity, 1.0]
                 affected_logit = params["logit_opacities"].data[temporal_floater, 0]
                 affected_opacity = torch.sigmoid(affected_logit)
-                # Gentle decay: multiply by 0.9 (not the Gumbel-Sigmoid which goes to ~0)
-                new_opacity = (affected_opacity * 0.9).clamp(0.01, 1 - 1e-6)
+                new_opacity = (affected_opacity * decay).clamp(opacity_floor, 1 - 1e-6)
                 new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
                 params["logit_opacities"].data[temporal_floater, 0] = new_logit_vals
                 n_degenerated += n_floaters
@@ -613,20 +610,15 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
             with torch.no_grad():
                 affected_logit = params["logit_opacities"].data[spatial_floater, 0]
                 affected_opacity = torch.sigmoid(affected_logit)
-                new_opacity = (affected_opacity * eta_spatial).clamp(1e-6, 1 - 1e-6)
+                new_opacity = (affected_opacity * eta_spatial).clamp(opacity_floor, 1 - 1e-6)
                 new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
                 params["logit_opacities"].data[spatial_floater, 0] = new_logit_vals
                 n_degenerated += spatial_floater.sum().item()
 
-    # --- Hard removal of dead Gaussians (opacity below threshold) ---
-    # This runs without an optimizer, so we just filter params directly
-    removal_threshold = 0.005
-    to_remove = (torch.sigmoid(params["logit_opacities"]) < removal_threshold).squeeze()
-    if to_remove.any():
-        # Can't use remove_points here (needs optimizer). Just mark for removal
-        # on next frame's mapping prune step. The standard prune at iter=0 will
-        # catch these on the next frame.
-        pass
+    # Note: no hard removal here. The opacity_floor ensures degenerated
+    # Gaussians stay above the standard removal threshold (0.005).
+    # They remain in the map with very low opacity, allowing recovery
+    # if they become visible from future viewpoints.
 
     return params, n_degenerated
 
