@@ -325,22 +325,26 @@ def gumbel_sigmoid_decay(tvs, tau_sig, temperature):
     """
     Compute Gumbel-Sigmoid soft degeneration factor.
 
-    gs(TVS) = 1 / (1 + exp(-(log(TVS) - tau_sig) / temperature))
+    decay = sigmoid( (log(TVS) - log(tau_sig)) / temperature )
 
-    When TVS is high -> decay_factor -> 1 (keep)
-    When TVS is low  -> decay_factor -> 0 (degenerate)
+    tau_sig is the TVS midpoint: Gaussians with TVS = tau_sig get decay = 0.5.
+    temperature controls transition width in log-space.
+
+    When TVS >> tau_sig -> decay -> 1 (keep, unchanged)
+    When TVS == tau_sig -> decay = 0.5 (half opacity per frame)
+    When TVS << tau_sig -> decay -> 0 (clamped to floor elsewhere)
 
     Args:
-        tvs: (M,) TVS scores for floater Gaussians
-        tau_sig: significance threshold (log-space)
-        temperature: sharpness of transition
+        tvs: (M,) TVS scores
+        tau_sig: significance midpoint (linear TVS space, e.g., 0.05)
+        temperature: transition width in log-space (e.g., 1.0)
 
     Returns:
         decay_factor: (M,) in (0, 1)
     """
-    # Clamp TVS to avoid log(0)
     safe_tvs = tvs.clamp(min=1e-10)
-    logit = (torch.log(safe_tvs) - tau_sig) / temperature
+    log_tau = torch.log(torch.tensor(tau_sig, device=tvs.device).clamp(min=1e-10))
+    logit = (torch.log(safe_tvs) - log_tau) / temperature
     decay_factor = torch.sigmoid(logit)
     return decay_factor
 
@@ -579,28 +583,34 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     N = params["means3D"].shape[0]
     n_degenerated = 0
 
-    # --- Temporal floaters: low TVS + mature ---
+    # --- TVS-guided soft degeneration (applied to ALL mature Gaussians) ---
+    # The Gumbel-Sigmoid provides a smooth per-Gaussian decay:
+    #   High TVS -> decay ~1.0 (unchanged)
+    #   TVS = tau_sig -> decay = 0.5 (midpoint)
+    #   Low TVS -> decay ~0 (clamped to floor)
+    # Only Gaussians whose opacity actually changes are written back
+    # (avoids floating-point drift on unchanged Gaussians).
     if "vis_history" in variables and "vis_frame_count" in variables:
         tvs = compute_tvs(variables, params, innovation_config)
         frame_count = _resize_1d(variables["vis_frame_count"], N)
-        temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
+        mature = frame_count > min_obs
 
-        if temporal_floater.any():
-            n_floaters = temporal_floater.sum().item()
+        if mature.any():
             with torch.no_grad():
-                # Gumbel-Sigmoid decay clamped by opacity_floor to prevent
-                # hard removal. Gaussians decay toward the floor but never
-                # cross the hard-removal threshold (0.005), allowing recovery
-                # if they become visible from future viewpoints.
-                decay = gumbel_sigmoid_decay(tvs[temporal_floater], tau_sig, temperature)
-                # Clamp decay to ensure opacity doesn't go below floor
-                # decay_factor in [floor/current_opacity, 1.0]
-                affected_logit = params["logit_opacities"].data[temporal_floater, 0]
+                decay = gumbel_sigmoid_decay(tvs[mature], tau_sig, temperature)
+                affected_logit = params["logit_opacities"].data[mature, 0]
                 affected_opacity = torch.sigmoid(affected_logit)
                 new_opacity = (affected_opacity * decay).clamp(opacity_floor, 1 - 1e-6)
-                new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
-                params["logit_opacities"].data[temporal_floater, 0] = new_logit_vals
-                n_degenerated += n_floaters
+
+                # Only write back Gaussians that actually changed (float-drift guard)
+                changed = (new_opacity - affected_opacity).abs() > 1e-6
+                if changed.any():
+                    mature_indices = torch.where(mature)[0]
+                    write_indices = mature_indices[changed]
+                    changed_opacity = new_opacity[changed]
+                    new_logit_vals = torch.log(changed_opacity / (1 - changed_opacity))
+                    params["logit_opacities"].data[write_indices, 0] = new_logit_vals
+                    n_degenerated += changed.sum().item()
 
     # --- Spatial floaters: mild fixed decay ---
     if (enable_spatial and curr_data is not None and transformed_pts is not None):
