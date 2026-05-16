@@ -982,6 +982,22 @@ def rgbd_slam(config: dict):
         tracking_frame_time_sum += time.time() - tracking_start_time
         tracking_frame_time_count += 1
 
+        # Update visibility buffer ONCE per frame, using gauss_vis from the
+        # last tracking render (which rendered the CURRENT frame).
+        # This must happen after tracking (so gauss_vis reflects current viewpoint)
+        # and before mapping (so the buffer is fresh for pruning decisions).
+        innovation_cfg = config.get("innovations", {})
+        if "gauss_vis" in variables and time_idx > 0:
+            with torch.no_grad():
+                if innovation_cfg.get("enable_tvs_pruning", False):
+                    variables = update_vis_buffer(
+                        variables, variables["gauss_vis"], innovation_cfg
+                    )
+                elif innovation_cfg.get("enable_visibility_pruning", False):
+                    variables = update_three_way_classifier(
+                        variables, variables["gauss_vis"], innovation_cfg
+                    )
+
         # ----------------------------------------------------
         # MAPPING (Densification + Optimization)
         # ----------------------------------------------------
@@ -1116,19 +1132,6 @@ def rgbd_slam(config: dict):
 
                 with torch.no_grad():
                     innovation_cfg = config.get("innovations", {})
-
-                    # Update visibility buffer BEFORE prune/densify so
-                    # vis_history stays index-aligned with the current
-                    # Gaussian set. Works for both TVS and legacy paths.
-                    if "gauss_vis" in variables:
-                        if innovation_cfg.get("enable_tvs_pruning", False):
-                            variables = update_vis_buffer(
-                                variables, variables["gauss_vis"], innovation_cfg
-                            )
-                        elif innovation_cfg.get("enable_visibility_pruning", False):
-                            variables = update_three_way_classifier(
-                                variables, variables["gauss_vis"], innovation_cfg
-                            )
 
                     # Pruning (TVS-guided, legacy, or baseline)
                     if config["mapping"]["prune_gaussians"]:
