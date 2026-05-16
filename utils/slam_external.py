@@ -495,22 +495,21 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                     temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
 
                     # Apply Gumbel-Sigmoid soft degeneration ONLY to affected Gaussians.
-                    # Use in-place .data modification + selective optimizer state reset
-                    # to avoid wiping momentum for ALL Gaussians (which destabilized
-                    # opacity optimization globally).
+                    # Directly modify only the affected indices in logit_opacities.data
+                    # to avoid numerical drift from full sigmoid->inverse_sigmoid roundtrip.
                     if temporal_floater.any():
                         with torch.no_grad():
                             decay = gumbel_sigmoid_decay(
                                 tvs[temporal_floater], tau_sig, temperature
                             )
-                            # In-place modify only the affected logit_opacities
-                            opacities = torch.sigmoid(params["logit_opacities"].squeeze())
-                            opacities[temporal_floater] = opacities[temporal_floater] * decay
-                            opacities = opacities.clamp(1e-6, 1 - 1e-6)
-                            new_logit = torch.log(opacities / (1 - opacities))
-                            # Write back in-place (preserves optimizer state for unaffected Gaussians)
-                            params["logit_opacities"].data.copy_(new_logit.unsqueeze(-1))
-                            # Reset optimizer state ONLY for the affected indices
+                            # Compute new logit ONLY for affected Gaussians
+                            old_logit = params["logit_opacities"].data[temporal_floater].squeeze()
+                            old_opacity = torch.sigmoid(old_logit)
+                            new_opacity = (old_opacity * decay).clamp(1e-6, 1 - 1e-6)
+                            new_logit = torch.log(new_opacity / (1 - new_opacity))
+                            # Write back only the affected indices
+                            params["logit_opacities"].data[temporal_floater] = new_logit.unsqueeze(-1)
+                            # Reset optimizer state for affected indices only
                             _reset_optimizer_state_subset(optimizer, "logit_opacities", temporal_floater)
 
                 # --- Spatial floaters: mild fixed decay ---
@@ -523,12 +522,13 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                     )
                     if spatial_floater.any():
                         with torch.no_grad():
-                            opacities = torch.sigmoid(params["logit_opacities"].squeeze())
-                            opacities[spatial_floater] = opacities[spatial_floater] * eta_spatial
-                            opacities = opacities.clamp(1e-6, 1 - 1e-6)
-                            new_logit = torch.log(opacities / (1 - opacities))
-                            params["logit_opacities"].data.copy_(new_logit.unsqueeze(-1))
-                            # Reset optimizer state ONLY for spatial floaters
+                            # Modify only affected indices
+                            old_logit = params["logit_opacities"].data[spatial_floater].squeeze()
+                            old_opacity = torch.sigmoid(old_logit)
+                            new_opacity = (old_opacity * eta_spatial).clamp(1e-6, 1 - 1e-6)
+                            new_logit = torch.log(new_opacity / (1 - new_opacity))
+                            params["logit_opacities"].data[spatial_floater] = new_logit.unsqueeze(-1)
+                            # Reset optimizer state for affected indices only
                             _reset_optimizer_state_subset(optimizer, "logit_opacities", spatial_floater)
 
             # === LEGACY: Old dual-mask pruning (for backward compat) ===
