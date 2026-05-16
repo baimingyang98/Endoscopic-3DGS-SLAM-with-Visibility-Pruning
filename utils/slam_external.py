@@ -143,6 +143,30 @@ def update_params_and_optimizer(new_params, params, optimizer):
     return params
 
 
+def _reset_optimizer_state_subset(optimizer, param_name, mask):
+    """
+    Reset Adam optimizer state (exp_avg, exp_avg_sq) for a SUBSET of indices
+    within a parameter, identified by a boolean mask.
+
+    This avoids wiping momentum for ALL Gaussians when only a few had their
+    opacity degenerated. Preserves optimization stability for unaffected Gaussians.
+
+    Args:
+        optimizer: Adam optimizer
+        param_name: name of the parameter group (e.g., "logit_opacities")
+        mask: (N,) boolean tensor, True = reset this Gaussian's state
+    """
+    group = [g for g in optimizer.param_groups if g["name"] == param_name]
+    if not group:
+        return
+    group = group[0]
+    stored_state = optimizer.state.get(group["params"][0], None)
+    if stored_state is not None:
+        # Zero out momentum only for affected indices
+        stored_state["exp_avg"][mask] = 0.0
+        stored_state["exp_avg_sq"][mask] = 0.0
+
+
 def cat_params_to_optimizer(new_params, params, optimizer):
     """Concatenate new Gaussians to existing parameters and optimizer state."""
     for k, v in new_params.items():
@@ -470,18 +494,24 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                     frame_count = _resize_1d(variables["vis_frame_count"], N)
                     temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
 
-                    # Apply Gumbel-Sigmoid soft degeneration
+                    # Apply Gumbel-Sigmoid soft degeneration ONLY to affected Gaussians.
+                    # Use in-place .data modification + selective optimizer state reset
+                    # to avoid wiping momentum for ALL Gaussians (which destabilized
+                    # opacity optimization globally).
                     if temporal_floater.any():
                         with torch.no_grad():
                             decay = gumbel_sigmoid_decay(
                                 tvs[temporal_floater], tau_sig, temperature
                             )
+                            # In-place modify only the affected logit_opacities
                             opacities = torch.sigmoid(params["logit_opacities"].squeeze())
                             opacities[temporal_floater] = opacities[temporal_floater] * decay
                             opacities = opacities.clamp(1e-6, 1 - 1e-6)
-                            new_logit = torch.log(opacities / (1 - opacities)).unsqueeze(-1)
-                            new_params = {"logit_opacities": new_logit}
-                            params = update_params_and_optimizer(new_params, params, optimizer)
+                            new_logit = torch.log(opacities / (1 - opacities))
+                            # Write back in-place (preserves optimizer state for unaffected Gaussians)
+                            params["logit_opacities"].data.copy_(new_logit.unsqueeze(-1))
+                            # Reset optimizer state ONLY for the affected indices
+                            _reset_optimizer_state_subset(optimizer, "logit_opacities", temporal_floater)
 
                 # --- Spatial floaters: mild fixed decay ---
                 if (enable_spatial
@@ -496,9 +526,10 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,
                             opacities = torch.sigmoid(params["logit_opacities"].squeeze())
                             opacities[spatial_floater] = opacities[spatial_floater] * eta_spatial
                             opacities = opacities.clamp(1e-6, 1 - 1e-6)
-                            new_logit = torch.log(opacities / (1 - opacities)).unsqueeze(-1)
-                            new_params = {"logit_opacities": new_logit}
-                            params = update_params_and_optimizer(new_params, params, optimizer)
+                            new_logit = torch.log(opacities / (1 - opacities))
+                            params["logit_opacities"].data.copy_(new_logit.unsqueeze(-1))
+                            # Reset optimizer state ONLY for spatial floaters
+                            _reset_optimizer_state_subset(optimizer, "logit_opacities", spatial_floater)
 
             # === LEGACY: Old dual-mask pruning (for backward compat) ===
             elif (innovation_config is not None
