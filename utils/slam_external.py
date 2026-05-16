@@ -572,6 +572,16 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     eta_spatial = innovation_config.get("eta_spatial", 0.9)
     enable_spatial = innovation_config.get("enable_spatial_mask", True)
 
+    # Debug: print first 5 calls to verify function behavior
+    if not hasattr(tvs_degenerate_between_frames, "_call_count"):
+        tvs_degenerate_between_frames._call_count = 0
+    tvs_degenerate_between_frames._call_count += 1
+    if tvs_degenerate_between_frames._call_count <= 5:
+        has_hist = "vis_history" in variables
+        print(f"  [TVS-DEBUG] call #{tvs_degenerate_between_frames._call_count}: "
+              f"N={params['means3D'].shape[0]}, has_vis_hist={has_hist}, "
+              f"min_obs={min_obs}, enable_spatial={enable_spatial}")
+
     N = params["means3D"].shape[0]
     n_degenerated = 0
 
@@ -582,6 +592,10 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
         temporal_floater = (tvs < tau_sig) & (frame_count > min_obs)
 
         if temporal_floater.any():
+            n_floaters = temporal_floater.sum().item()
+            print(f"    [TVS] Degenerating {n_floaters}/{N} temporal floaters "
+                  f"(frame_count max={frame_count.max().item():.0f}, "
+                  f"tvs range=[{tvs.min().item():.4f}, {tvs.max().item():.4f}])")
             with torch.no_grad():
                 decay = gumbel_sigmoid_decay(tvs[temporal_floater], tau_sig, temperature)
                 affected_logit = params["logit_opacities"].data[temporal_floater, 0]
@@ -589,7 +603,7 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                 new_opacity = (affected_opacity * decay).clamp(1e-6, 1 - 1e-6)
                 new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
                 params["logit_opacities"].data[temporal_floater, 0] = new_logit_vals
-                n_degenerated += temporal_floater.sum().item()
+                n_degenerated += n_floaters
 
     # --- Spatial floaters: mild fixed decay ---
     if (enable_spatial and curr_data is not None and transformed_pts is not None):
