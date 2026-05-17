@@ -22,26 +22,48 @@ import torch.nn.functional as F
 # Flow-Guided Pose Initialization
 # ============================================================
 
-def load_flow(flow_dir, frame_idx):
+def load_flow(flow_dir, frame_idx, target_hw=None):
     """
     Load precomputed optical flow for frame pair (frame_idx, frame_idx+1).
+
+    If `target_hw=(H_tgt, W_tgt)` is provided and the stored flow resolution
+    differs, the flow tensor is resized AND the flow vectors are scaled by the
+    corresponding axis ratios. This is essential because RAFT was precomputed
+    on the raw image resolution (e.g. 1080x1350) while SLAM operates at the
+    downsampled resolution (e.g. 540x675); using the raw flow directly would
+    produce a systematic 2x scale mismatch in both PnP-based pose init and
+    Gaussian-flow loss.
 
     Args:
         flow_dir: directory containing flow_XXXX.npy files
         frame_idx: index of the source frame
+        target_hw: optional (H, W) target resolution; if set, resize + rescale
 
     Returns:
-        flow: (H, W, 2) numpy float32 array, or None if not found
+        flow: (H, W, 2) numpy float32 array at target resolution (or stored
+              resolution if target_hw is None), or None if not found
     """
     flow_path = os.path.join(flow_dir, f"flow_{frame_idx:04d}.npy")
     if not os.path.exists(flow_path):
         return None
     flow = np.load(flow_path).astype(np.float32)
+
+    if target_hw is not None:
+        H_tgt, W_tgt = int(target_hw[0]), int(target_hw[1])
+        H_raw, W_raw = flow.shape[:2]
+        if (H_raw, W_raw) != (H_tgt, W_tgt):
+            sx = float(W_tgt) / float(W_raw)
+            sy = float(H_tgt) / float(H_raw)
+            flow = cv2.resize(flow, (W_tgt, H_tgt), interpolation=cv2.INTER_LINEAR)
+            # Scale flow VECTORS (displacements are in pixels of their resolution)
+            flow[..., 0] *= sx
+            flow[..., 1] *= sy
     return flow
 
 
 def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
-                          confidence_threshold=0.5, n_points=500):
+                          confidence_threshold=0.5, n_points=500,
+                          depth_min=0.001, depth_max=10.0, debug=False):
     """
     Estimate initial camera pose from optical flow + depth using PnP.
 
@@ -50,14 +72,20 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
 
     Falls back to constant-velocity model if PnP fails or flow is unreliable.
 
+    IMPORTANT: `flow` must be at the same resolution as `depth` AND consistent
+    with `intrinsics`. Use `load_flow(..., target_hw=(H, W))` upstream to
+    guarantee this.
+
     Args:
         params: parameter dict (cam_unnorm_rots, cam_trans)
         time_idx: current frame index (we estimate pose for this frame)
-        flow: (H, W, 2) optical flow from frame t-1 to t
-        depth: (1, H, W) or (H, W) depth map at frame t-1
-        intrinsics: (3, 3) camera intrinsic matrix
-        confidence_threshold: min flow magnitude to use a point
-        n_points: number of correspondence points to sample
+        flow: (H, W, 2) optical flow from frame t-1 to t (at SLAM resolution)
+        depth: (1, H, W) or (H, W) depth map at frame t-1 (at SLAM resolution)
+        intrinsics: (3, 3) camera intrinsic matrix (at SLAM resolution)
+        confidence_threshold: min flow magnitude (in SLAM pixels) to use a point
+        n_points: number of correspondence points to sample (deterministic)
+        depth_min, depth_max: valid depth range (endoscopy: ~0.001 to ~10 m)
+        debug: if True, print PnP diagnostics
 
     Returns:
         params: updated with initial pose estimate for time_idx
@@ -72,19 +100,34 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
     else:
         depth_np = depth.cpu().numpy()
 
+    # Defensive: shapes must match. If they don't, the caller forgot target_hw.
+    if depth_np.shape[:2] != (H, W):
+        if debug:
+            print(f"[flow_init t={time_idx}] SHAPE MISMATCH: "
+                  f"flow={flow.shape}, depth={depth_np.shape} -> skip")
+        return params, False
+
     # Compute flow magnitude for confidence filtering
     flow_mag = np.sqrt(flow[:, :, 0] ** 2 + flow[:, :, 1] ** 2)
 
     # Valid points: positive depth + sufficient flow
-    valid_mask = (depth_np > 0.01) & (depth_np < 100.0) & (flow_mag > confidence_threshold)
+    valid_mask = (depth_np > depth_min) & (depth_np < depth_max) & (flow_mag > confidence_threshold)
     valid_ys, valid_xs = np.where(valid_mask)
 
+    if debug:
+        print(f"[flow_init t={time_idx}] depth range=[{depth_np.min():.4f}, "
+              f"{depth_np.max():.4f}], flow_mag mean={flow_mag.mean():.3f}, "
+              f"valid points={len(valid_ys)}")
+
     if len(valid_ys) < 10:
+        if debug:
+            print(f"[flow_init t={time_idx}] too few valid points -> skip")
         return params, False
 
-    # Sample points (uniform random from valid set)
+    # Sample points DETERMINISTICALLY (seeded by time_idx for reproducibility)
     n_sample = min(n_points, len(valid_ys))
-    indices = np.random.choice(len(valid_ys), n_sample, replace=False)
+    rng = np.random.default_rng(int(time_idx))
+    indices = rng.choice(len(valid_ys), n_sample, replace=False)
     ys = valid_ys[indices]
     xs = valid_xs[indices]
 
@@ -115,7 +158,15 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
     )
 
     if not success or inliers is None or len(inliers) < 5:
+        if debug:
+            n_in = 0 if inliers is None else len(inliers)
+            print(f"[flow_init t={time_idx}] PnP failed (success={success}, "
+                  f"inliers={n_in}) -> fallback")
         return params, False
+
+    if debug:
+        print(f"[flow_init t={time_idx}] PnP OK: inliers={len(inliers)}/{n_sample}, "
+              f"|rvec|={np.linalg.norm(rvec):.4f}, |tvec|={np.linalg.norm(tvec):.4f}")
 
     # Convert to rotation matrix
     R, _ = cv2.Rodrigues(rvec)
@@ -169,7 +220,7 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
 # ============================================================
 
 def compute_flow_loss(params, time_idx_a, time_idx_b, gt_flow, cam_settings,
-                      intrinsics, max_points=10000):
+                      intrinsics, max_points=10000, debug=False):
     """
     Compute optical flow loss between two frames.
 
@@ -194,9 +245,12 @@ def compute_flow_loss(params, time_idx_a, time_idx_b, gt_flow, cam_settings,
     """
     from utils.slam_external import build_rotation
 
-    # Get camera poses for both frames
-    rot_a = F.normalize(params["cam_unnorm_rots"][..., time_idx_a])
-    tran_a = params["cam_trans"][..., time_idx_a]
+    # Get camera poses for both frames. Frame A (previous) is detached so the
+    # flow loss only sends gradients to the CURRENT pose (frame B) and to the
+    # Gaussian positions. Otherwise gradients leak back to already-finalized
+    # historical poses, corrupting them.
+    rot_a = F.normalize(params["cam_unnorm_rots"][..., time_idx_a].detach())
+    tran_a = params["cam_trans"][..., time_idx_a].detach()
     rot_b = F.normalize(params["cam_unnorm_rots"][..., time_idx_b])
     tran_b = params["cam_trans"][..., time_idx_b]
 
@@ -289,5 +343,13 @@ def compute_flow_loss(params, time_idx_a, time_idx_b, gt_flow, cam_settings,
     gs_fv = gs_flow_v[in_bounds]
 
     flow_loss = torch.mean((gs_fu - gt_fu) ** 2 + (gs_fv - gt_fv) ** 2)
+
+    if debug:
+        with torch.no_grad():
+            gs_mag = torch.sqrt(gs_fu ** 2 + gs_fv ** 2).mean().item()
+            gt_mag = torch.sqrt(gt_fu ** 2 + gt_fv ** 2).mean().item()
+            print(f"[flow_loss a={time_idx_a} b={time_idx_b}] "
+                  f"K={in_bounds.sum().item()}, |gs_flow|={gs_mag:.3f}, "
+                  f"|gt_flow|={gt_mag:.3f}, loss={flow_loss.item():.4f}")
 
     return flow_loss

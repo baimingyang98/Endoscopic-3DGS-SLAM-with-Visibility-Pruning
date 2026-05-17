@@ -886,6 +886,7 @@ def rgbd_slam(config: dict):
                 flow_subdir = innovation_cfg.get("flow_dir", "flow")
                 flow_dir = os.path.join(config["data"]["basedir"], config["data"]["sequence"], flow_subdir)
                 flow_conf_thresh = innovation_cfg.get("flow_confidence_threshold", 0.5)
+                debug_flow = innovation_cfg.get("debug_flow", False)
 
                 from utils.flow_utils import load_flow, flow_guided_pose_init
                 # Flow from frame (time_idx-1) -> time_idx
@@ -896,7 +897,13 @@ def rgbd_slam(config: dict):
                 #   full_idx = i + (i // 7)  [every 7 train frames, one test frame was skipped]
                 # For flow: we need the flow between full_idx(time_idx-1) and full_idx(time_idx)
                 full_idx_prev = (time_idx - 1) + ((time_idx - 1) // 7)
-                flow_data = load_flow(flow_dir, full_idx_prev)
+                # CRITICAL: target_hw resizes flow to SLAM resolution AND rescales
+                # flow vectors. RAFT was precomputed on raw 1080x1350 but SLAM
+                # runs at 540x675; without this, PnP gets inconsistent geometry.
+                flow_data = load_flow(
+                    flow_dir, full_idx_prev,
+                    target_hw=(cam.image_height, cam.image_width),
+                )
                 if flow_data is not None:
                     # BUG FIX: flow_guided_pose_init needs PREVIOUS frame's depth
                     # (frame t-1), not current frame's depth. Load it from dataset.
@@ -905,6 +912,7 @@ def rgbd_slam(config: dict):
                     params, flow_init_success = flow_guided_pose_init(
                         params, time_idx, flow_data, prev_depth, intrinsics,
                         confidence_threshold=flow_conf_thresh,
+                        debug=debug_flow,
                     )
 
             # Fallback to constant-velocity model if flow init failed or disabled
@@ -1120,12 +1128,21 @@ def rgbd_slam(config: dict):
                     from utils.flow_utils import load_flow, compute_flow_loss
                     # Map train-split index to full-sequence file index for flow lookup
                     full_idx_prev = (time_idx - 1) + ((time_idx - 1) // 7)
-                    gt_flow = load_flow(flow_dir, full_idx_prev)
+                    # Resize flow to SLAM resolution + rescale flow vectors so
+                    # Gaussian-flow (in SLAM pixels) and GT flow are comparable.
+                    gt_flow = load_flow(
+                        flow_dir, full_idx_prev,
+                        target_hw=(cam.image_height, cam.image_width),
+                    )
                     if gt_flow is not None:
                         lambda_flow = innovation_cfg_map.get("lambda_flow", 0.1)
+                        debug_flow_loss = (
+                            innovation_cfg_map.get("debug_flow", False) and iter == 0
+                        )
                         flow_loss = compute_flow_loss(
                             params, time_idx - 1, time_idx,
                             gt_flow, cam, intrinsics,
+                            debug=debug_flow_loss,
                         )
                         loss = loss + lambda_flow * flow_loss
 
