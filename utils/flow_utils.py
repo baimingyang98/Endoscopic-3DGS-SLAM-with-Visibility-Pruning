@@ -180,6 +180,7 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
                           irls_iters=5, cauchy_c=1.0,
                           max_pixels=50000,
                           translation_gate=0.1, rotation_gate=0.1,
+                          neg_xi=False, invert_T=False,
                           debug=False):
     """
     Estimate initial camera pose via Flow4DGS-style linearized twist solver.
@@ -321,14 +322,14 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
         W_stack = 1.0 / (1.0 + (r / cauchy_c) ** 2)
         final_residual_rms = float(torch.sqrt((r * r).mean()).item())
 
-    # SIGN CORRECTION: the projective image Jacobian J(x) is derived for the
-    # apparent flow of a STATIC scene point as seen by a camera moving with
-    # body twist xi. The relationship F = J*xi holds with xi being the
-    # *negative* of the camera-frame twist that maps points A->B. Empirical
-    # validation: synthetic camera motion exp(xi_gt) produced flow that the
-    # linear solver recovered as -xi_gt (max diff 0.038 in raw form; 0.0016
-    # after this negation). Therefore T(cam_B <- cam_A) = exp(-xi_raw).
-    xi = -xi
+    # Sign convention is controlled by neg_xi flag (set from config).
+    # Synthetic experiments suggest the IRLS-recovered xi is the negative of
+    # the point-transform twist (i.e., it is the CAMERA-motion twist).
+    # To get the point-transform T(B<-A) we need exp(-xi). But the empirical
+    # result depends on the actual flow direction convention, so we expose
+    # both sign and inversion as config flags.
+    if neg_xi:
+        xi = -xi
 
     rho = xi[:3]
     theta = xi[3:]
@@ -356,12 +357,26 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
 
     with torch.no_grad():
         T_rel = _exp_se3(xi)               # (4, 4)
+        if invert_T:
+            T_rel = torch.linalg.inv(T_rel)
 
         prev_rot = F.normalize(params["cam_unnorm_rots"][..., time_idx - 1].detach())
         prev_tran = params["cam_trans"][..., time_idx - 1].detach()
         prev_w2c = torch.eye(4, dtype=dtype, device=device)
         prev_w2c[:3, :3] = build_rotation(prev_rot)
         prev_w2c[:3, 3] = prev_tran
+
+        if debug and time_idx >= 2:
+            # Compare to constant-velocity prediction
+            prev_tran2 = params["cam_trans"][..., time_idx - 2].detach()
+            cv_delta = (prev_tran - prev_tran2).cpu().numpy()
+            irls_delta_cam = T_rel[:3, 3].cpu().numpy()  # translation in cam frame
+            print(f"[flow_init t={time_idx}] cv_delta_world="
+                  f"({cv_delta[0]:+.3f},{cv_delta[1]:+.3f},{cv_delta[2]:+.3f}) "
+                  f"|cv|={float(np.linalg.norm(cv_delta)):.3f}; "
+                  f"irls_t_cam="
+                  f"({irls_delta_cam[0]:+.3f},{irls_delta_cam[1]:+.3f},{irls_delta_cam[2]:+.3f})",
+                  flush=True)
 
         # new_w2c = T_rel @ prev_w2c  (flow is t-1 -> t, so T_rel = T(t <- t-1))
         new_w2c = T_rel @ prev_w2c

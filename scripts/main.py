@@ -919,6 +919,8 @@ def rgbd_slam(config: dict):
                         max_pixels=innovation_cfg.get("flow_init_max_pixels", 50000),
                         translation_gate=innovation_cfg.get("flow_init_translation_gate", 0.1),
                         rotation_gate=innovation_cfg.get("flow_init_rotation_gate", 0.1),
+                        neg_xi=innovation_cfg.get("flow_init_neg_xi", False),
+                        invert_T=innovation_cfg.get("flow_init_invert_T", False),
                         debug=debug_flow,
                     )
 
