@@ -235,7 +235,8 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
     if depth_np.shape[:2] != (H, W):
         if debug:
             print(f"[flow_init t={time_idx}] SHAPE MISMATCH: "
-                  f"flow={flow.shape}, depth={depth_np.shape} -> skip")
+                  f"flow={flow.shape}, depth={depth_np.shape} -> skip",
+                  flush=True)
         return params, False
 
     # Compute flow magnitude for confidence filtering
@@ -249,11 +250,13 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
     if debug:
         print(f"[flow_init t={time_idx}] depth range=[{depth_np.min():.4f}, "
               f"{depth_np.max():.4f}], flow_mag mean={flow_mag.mean():.3f}, "
-              f"valid pixels={n_valid}")
+              f"valid pixels={n_valid}",
+              flush=True)
 
     if n_valid < 50:
         if debug:
-            print(f"[flow_init t={time_idx}] too few valid pixels -> fallback")
+            print(f"[flow_init t={time_idx}] too few valid pixels -> fallback",
+                  flush=True)
         return params, False
 
     # Deterministic stride subsampling (no randomness)
@@ -308,7 +311,8 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
         except RuntimeError:
             if debug:
                 print(f"[flow_init t={time_idx}] IRLS solve failed at iter "
-                      f"{irls_step} -> fallback")
+                      f"{irls_step} -> fallback",
+                      flush=True)
             return params, False
 
         # Residuals and Cauchy weights for next iter
@@ -316,6 +320,15 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
         r = F_stack - F_pred               # (2N,)
         W_stack = 1.0 / (1.0 + (r / cauchy_c) ** 2)
         final_residual_rms = float(torch.sqrt((r * r).mean()).item())
+
+    # SIGN CORRECTION: the projective image Jacobian J(x) is derived for the
+    # apparent flow of a STATIC scene point as seen by a camera moving with
+    # body twist xi. The relationship F = J*xi holds with xi being the
+    # *negative* of the camera-frame twist that maps points A->B. Empirical
+    # validation: synthetic camera motion exp(xi_gt) produced flow that the
+    # linear solver recovered as -xi_gt (max diff 0.038 in raw form; 0.0016
+    # after this negation). Therefore T(cam_B <- cam_A) = exp(-xi_raw).
+    xi = -xi
 
     rho = xi[:3]
     theta = xi[3:]
@@ -327,13 +340,15 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
         if debug:
             print(f"[flow_init t={time_idx}] sanity gate FAIL "
                   f"(|rho|={rho_norm:.4f}, |theta|={theta_norm:.4f}, "
-                  f"rms={final_residual_rms:.3f}) -> fallback")
+                  f"rms={final_residual_rms:.3f}) -> fallback",
+                  flush=True)
         return params, False
 
     if debug:
         print(f"[flow_init t={time_idx}] IRLS OK: used={n_used}, "
               f"rms={final_residual_rms:.3f}, |rho|={rho_norm:.4f}, "
-              f"|theta|={theta_norm:.4f}")
+              f"|theta|={theta_norm:.4f}",
+              flush=True)
 
     # Build T_rel from twist and compose with previous w2c
     from utils.slam_external import build_rotation
