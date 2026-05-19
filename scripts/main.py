@@ -1326,11 +1326,21 @@ def rgbd_slam(config: dict):
             "depth": refine_depth_weight,
         }
 
-        # Create optimizer for Gaussians only (no camera pose updates)
-        refine_lrs = {k: config["mapping"]["lrs"].get(k, 0.0) for k in params.keys()
-                      if k not in ["cam_unnorm_rots", "cam_trans"]}
+        # Create optimizer for Gaussians only (no camera pose updates).
+        # Refinement LRs can be scaled up vs mapping defaults to make the
+        # polish phase actually move parameters. Cap to a reasonable upper
+        # bound (e.g. 10x mapping). Pose LRs are forced to zero.
+        refine_lr_scale = innovation_cfg.get("refine_lr_scale", 1.0)
+        refine_lrs = {
+            k: config["mapping"]["lrs"].get(k, 0.0) * refine_lr_scale
+            for k in params.keys()
+            if k not in ["cam_unnorm_rots", "cam_trans"]
+        }
         refine_lrs["cam_unnorm_rots"] = 0.0
         refine_lrs["cam_trans"] = 0.0
+        print(f"  Refinement LR scale: {refine_lr_scale}x (means3D="
+              f"{refine_lrs.get('means3D', 0.0):.5f}, "
+              f"rgb_colors={refine_lrs.get('rgb_colors', 0.0):.5f})")
 
         # Build the refinement frame pool
         if refine_all_frames:
