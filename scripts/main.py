@@ -1314,6 +1314,10 @@ def rgbd_slam(config: dict):
         refine_stage1_iters = innovation_cfg.get("refine_stage1_iters", 100)
         refine_stage2_iters = innovation_cfg.get("refine_stage2_iters", 500)
         refine_lambda_dssim = innovation_cfg.get("refine_lambda_dssim", 0.2)
+        # refine_all_frames: if True, refine over ALL train frames (not just
+        # keyframes). EndoFlow-style: their +4dB refinement gain comes from
+        # touching every frame, not just 1/keyframe_every of them.
+        refine_all_frames = innovation_cfg.get("refine_all_frames", True)
 
         # Create optimizer for Gaussians only (no camera pose updates)
         refine_lrs = {k: config["mapping"]["lrs"].get(k, 0.0) for k in params.keys()
@@ -1321,33 +1325,47 @@ def rgbd_slam(config: dict):
         refine_lrs["cam_unnorm_rots"] = 0.0
         refine_lrs["cam_trans"] = 0.0
 
-        # Stage 1: Keyframe-priority refinement (worst-quality first)
-        print(f"  Stage 1: Refining {len(keyframe_list)} keyframes ({refine_stage1_iters} iters each)...")
-        # Compute current PSNR for each keyframe to rank them
-        keyframe_psnrs = []
-        with torch.no_grad():
-            for kf in keyframe_list:
-                kf_transformed = transform_to_frame(params, kf["id"], gaussians_grad=False, camera_grad=False)
-                kf_rendervar = transformed_params2rendervar(params, kf_transformed)
-                kf_out = Renderer(raster_settings=cam)(**kf_rendervar)
-                kf_im = kf_out[0]
-                kf_psnr = -10 * torch.log10(((kf_im - kf["color"]) ** 2).mean())
-                keyframe_psnrs.append(kf_psnr.item())
+        # Build the refinement frame pool: either all train frames or only kfs.
+        # Each entry: {"id": int, "color": (3,H,W) cuda, "depth": (1,H,W) cuda}
+        if refine_all_frames:
+            print(f"  Building refinement pool from ALL {num_frames} train frames...")
+            refine_pool = []
+            for t_idx in range(num_frames):
+                rc, rd, _, _ = dataset[t_idx]
+                rc = (rc.permute(2, 0, 1) / 255).cuda()
+                rd = rd.permute(2, 0, 1).cuda()
+                refine_pool.append({"id": t_idx, "color": rc, "depth": rd})
+        else:
+            refine_pool = keyframe_list
+        print(f"  Refinement pool size: {len(refine_pool)} frames")
 
-        # Sort keyframes by PSNR (worst first)
-        sorted_kf_indices = np.argsort(keyframe_psnrs)
+        # Stage 1: Per-frame refinement (worst-quality first)
+        print(f"  Stage 1: Refining {len(refine_pool)} frames ({refine_stage1_iters} iters each)...")
+        # Compute current PSNR per frame to rank them
+        frame_psnrs = []
+        with torch.no_grad():
+            for f in refine_pool:
+                f_transformed = transform_to_frame(params, f["id"], gaussians_grad=False, camera_grad=False)
+                f_rendervar = transformed_params2rendervar(params, f_transformed)
+                f_out = Renderer(raster_settings=cam)(**f_rendervar)
+                f_im = f_out[0]
+                f_psnr = -10 * torch.log10(((f_im - f["color"]) ** 2).mean())
+                frame_psnrs.append(f_psnr.item())
+
+        # Sort by PSNR (worst first)
+        sorted_indices = np.argsort(frame_psnrs)
 
         refine_optimizer = initialize_optimizer(params, refine_lrs)
         from utils.slam_external import calc_ssim as refine_ssim
-        refine_bar = tqdm(range(len(keyframe_list) * refine_stage1_iters), desc="  Refine S1")
+        refine_bar = tqdm(range(len(refine_pool) * refine_stage1_iters), desc="  Refine S1")
 
-        for kf_rank in sorted_kf_indices:
-            kf = keyframe_list[kf_rank]
-            kf_data = {"cam": cam, "im": kf["color"], "depth": kf["depth"],
-                       "id": kf["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
+        for rank in sorted_indices:
+            f = refine_pool[rank]
+            f_data = {"cam": cam, "im": f["color"], "depth": f["depth"],
+                      "id": f["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
             for _ in range(refine_stage1_iters):
                 loss_r, _, _ = get_loss(
-                    params, kf_data, variables, kf["id"],
+                    params, f_data, variables, f["id"],
                     config["mapping"]["loss_weights"],
                     config["mapping"]["use_sil_for_loss"],
                     config["mapping"]["sil_thres"],
@@ -1356,11 +1374,11 @@ def rgbd_slam(config: dict):
                     mapping=True,
                 )
                 # Add DSSIM term for structural preservation
-                kf_transformed = transform_to_frame(params, kf["id"], gaussians_grad=True, camera_grad=False)
-                kf_rendervar = transformed_params2rendervar(params, kf_transformed)
-                kf_out = Renderer(raster_settings=cam)(**kf_rendervar)
-                kf_im_r = kf_out[0]
-                dssim = 1.0 - refine_ssim(kf_im_r, kf["color"])
+                f_transformed = transform_to_frame(params, f["id"], gaussians_grad=True, camera_grad=False)
+                f_rendervar = transformed_params2rendervar(params, f_transformed)
+                f_out = Renderer(raster_settings=cam)(**f_rendervar)
+                f_im_r = f_out[0]
+                dssim = 1.0 - refine_ssim(f_im_r, f["color"])
                 loss_r = (1 - refine_lambda_dssim) * loss_r + refine_lambda_dssim * dssim
 
                 loss_r.backward()
@@ -1373,11 +1391,11 @@ def rgbd_slam(config: dict):
         print(f"  Stage 2: Global random refinement ({refine_stage2_iters} iters)...")
         refine_bar2 = tqdm(range(refine_stage2_iters), desc="  Refine S2")
         for _ in range(refine_stage2_iters):
-            rand_kf = keyframe_list[np.random.randint(0, len(keyframe_list))]
-            kf_data = {"cam": cam, "im": rand_kf["color"], "depth": rand_kf["depth"],
-                       "id": rand_kf["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
+            rand_f = refine_pool[np.random.randint(0, len(refine_pool))]
+            f_data = {"cam": cam, "im": rand_f["color"], "depth": rand_f["depth"],
+                      "id": rand_f["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
             loss_r, _, _ = get_loss(
-                params, kf_data, variables, rand_kf["id"],
+                params, f_data, variables, rand_f["id"],
                 config["mapping"]["loss_weights"],
                 config["mapping"]["use_sil_for_loss"],
                 config["mapping"]["sil_thres"],
