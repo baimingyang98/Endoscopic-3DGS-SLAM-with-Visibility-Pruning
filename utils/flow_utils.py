@@ -2,13 +2,21 @@
 Optical flow utilities for EndoGSLAM.
 
 Two main functions:
-1. flow_guided_pose_init: Use optical flow + depth to estimate initial camera pose
-2. compute_flow_loss: Per-Gaussian flow loss for mapping optimization
+1. flow_guided_pose_init: Flow4DGS-style Camera-Induced Motion Decomposition
+   (linearized image-Jacobian twist solver with IRLS Cauchy weighting) for
+   coarse camera pose initialization.
+2. compute_flow_loss: Per-Gaussian flow loss for mapping optimization.
 
-Based on ideas from:
-- Flow4DGS-SLAM (Wang & Lee, 2026): flow-guided pose initialization
-- EndoFlow-SLAM (Wu et al., 2025): Gaussian flow loss in mapping
-- GaussianFlow (Gao et al., 2024): per-Gaussian 2D displacement theory
+References:
+- Flow4DGS-SLAM (Wang & Lee, 2026): "Camera-Induced Motion Decomposition"
+  via the linearized image Jacobian F = J(x) * xi and IRLS-weighted
+  least-squares (Eqs. 1-3). Our flow_guided_pose_init faithfully adapts this
+  method for endoscopic SLAM: we drop the YOLOv9 dynamic-object mask (the
+  endoscopic scene is rigid) and operate at the SLAM (downsampled)
+  resolution. The image Jacobian (Eq. 2) follows projective geometry as in
+  Ma & Soatto, "An Invitation to 3D Vision" (Chapter 5).
+- EndoFlow-SLAM (Wu et al., 2025): Gaussian flow loss in mapping.
+- GaussianFlow (Gao et al., 2024): per-Gaussian 2D displacement theory.
 """
 import os
 
@@ -16,6 +24,111 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+# ============================================================
+# SE(3) Lie-algebra helpers
+# ============================================================
+
+def _skew(v):
+    """3-vector -> 3x3 skew-symmetric matrix [v]_x."""
+    z = torch.zeros((), dtype=v.dtype, device=v.device)
+    return torch.stack([
+        torch.stack([z, -v[2], v[1]]),
+        torch.stack([v[2], z, -v[0]]),
+        torch.stack([-v[1], v[0], z]),
+    ])
+
+
+def _exp_so3(theta):
+    """
+    SO(3) exponential map via Rodrigues' formula.
+    Input:  theta (3,) axis-angle rotation vector
+    Output: R (3, 3) rotation matrix
+    Small-angle Taylor series used when |theta| < 1e-6.
+    """
+    angle = torch.linalg.norm(theta)
+    K = _skew(theta)
+    I = torch.eye(3, dtype=theta.dtype, device=theta.device)
+    if angle < 1e-6:
+        # Taylor: R = I + K + 0.5 K^2
+        return I + K + 0.5 * (K @ K)
+    a = torch.sin(angle) / angle
+    b = (1.0 - torch.cos(angle)) / (angle * angle)
+    return I + a * K + b * (K @ K)
+
+
+def _exp_se3(xi):
+    """
+    SE(3) exponential map.
+    Input:  xi (6,) = [rho (3,) translation; theta (3,) rotation]
+    Output: T (4, 4) homogeneous transform
+    Uses Rodrigues + SE(3) left Jacobian V(theta).
+    """
+    rho = xi[:3]
+    theta = xi[3:]
+    angle = torch.linalg.norm(theta)
+    K = _skew(theta)
+    I = torch.eye(3, dtype=xi.dtype, device=xi.device)
+    if angle < 1e-6:
+        # Taylor: V = I + 0.5 K + (1/6) K^2
+        R = I + K + 0.5 * (K @ K)
+        V = I + 0.5 * K + (1.0 / 6.0) * (K @ K)
+    else:
+        a = torch.sin(angle) / angle
+        b = (1.0 - torch.cos(angle)) / (angle * angle)
+        c = (angle - torch.sin(angle)) / (angle ** 3)
+        R = I + a * K + b * (K @ K)
+        V = I + b * K + c * (K @ K)
+    t = V @ rho
+    T = torch.eye(4, dtype=xi.dtype, device=xi.device)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def _build_image_jacobian(u_c, v_c, Z, fx, fy):
+    """
+    Build per-pixel projective image Jacobian (Eq. 2 of Flow4DGS-SLAM).
+
+    J(x) = [[-fx/Z,    0,    u/Z,   u*v/fy,    -fx - u^2/fx,    v],
+            [   0, -fy/Z,    v/Z,   fy + v^2/fy,   -u*v/fx,    -u]]
+
+    where (u, v) are CENTERED pixel coordinates (i.e. u = u_pix - cx).
+
+    Inputs:
+        u_c, v_c, Z: (N,) tensors -- centered pixel coords and depths
+        fx, fy: scalars
+    Returns:
+        J: (2N, 6) tensor stacking the 2x6 per-pixel Jacobians as
+           [row_u_1, row_v_1, row_u_2, row_v_2, ...]
+    """
+    N = u_c.shape[0]
+    invZ = 1.0 / Z
+
+    # Row for u-component of flow (shape (N, 6))
+    Ju = torch.stack([
+        -fx * invZ,
+        torch.zeros_like(Z),
+        u_c * invZ,
+        u_c * v_c / fy,
+        -fx - (u_c * u_c) / fx,
+        v_c,
+    ], dim=1)
+
+    # Row for v-component of flow (shape (N, 6))
+    Jv = torch.stack([
+        torch.zeros_like(Z),
+        -fy * invZ,
+        v_c * invZ,
+        fy + (v_c * v_c) / fy,
+        -(u_c * v_c) / fx,
+        -u_c,
+    ], dim=1)
+
+    # Interleave rows: [Ju_1, Jv_1, Ju_2, Jv_2, ...] -> (2N, 6)
+    J = torch.stack([Ju, Jv], dim=1).reshape(2 * N, 6)
+    return J
 
 
 # ============================================================
@@ -62,34 +175,52 @@ def load_flow(flow_dir, frame_idx, target_hw=None):
 
 
 def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
-                          confidence_threshold=0.5, n_points=500,
-                          depth_min=0.001, depth_max=10.0, debug=False):
+                          confidence_threshold=0.5,
+                          depth_min=0.001, depth_max=10.0,
+                          irls_iters=5, cauchy_c=1.0,
+                          max_pixels=50000,
+                          translation_gate=0.1, rotation_gate=0.1,
+                          debug=False):
     """
-    Estimate initial camera pose from optical flow + depth using PnP.
+    Estimate initial camera pose via Flow4DGS-style linearized twist solver.
 
-    Given flow from frame (t-1) -> t and depth at frame (t-1), compute
-    3D-2D correspondences and solve PnP for the relative pose.
+    Faithful adaptation of Flow4DGS-SLAM "Camera-Induced Motion Decomposition"
+    (Wang & Lee, 2026, Eqs. 1-3):
 
-    Falls back to constant-velocity model if PnP fails or flow is unreliable.
+        F(u,v) = J(x) * xi                                    (Eq. 1)
+        xi_hat = arg min_xi sum_i w_i ||F_i - J_i xi||^2      (Eq. 3)
 
-    IMPORTANT: `flow` must be at the same resolution as `depth` AND consistent
-    with `intrinsics`. Use `load_flow(..., target_hw=(H, W))` upstream to
-    guarantee this.
+    where xi = [rho; theta] in se(3) is the camera twist and J is the 2x6
+    projective image Jacobian (Eq. 2). We solve via IRLS with Cauchy weights.
+
+    Adaptations for endoscopic SLAM:
+      - No YOLOv9 dynamic-object mask (endoscopic scene is rigid).
+      - Operates at SLAM resolution; caller MUST pass flow/depth/intrinsics
+        all at the same resolution (use load_flow(target_hw=...) upstream).
+
+    Sign convention: our precomputed flow is F(t-1 -> t) (see
+    scripts/precompute_flow.py), so the solved twist xi represents motion
+    from frame t-1 to frame t, giving T_rel = T(cam_t <- cam_{t-1}).
+    Composition: new_w2c = T_rel @ prev_w2c.
 
     Args:
         params: parameter dict (cam_unnorm_rots, cam_trans)
         time_idx: current frame index (we estimate pose for this frame)
-        flow: (H, W, 2) optical flow from frame t-1 to t (at SLAM resolution)
-        depth: (1, H, W) or (H, W) depth map at frame t-1 (at SLAM resolution)
-        intrinsics: (3, 3) camera intrinsic matrix (at SLAM resolution)
-        confidence_threshold: min flow magnitude (in SLAM pixels) to use a point
-        n_points: number of correspondence points to sample (deterministic)
+        flow: (H, W, 2) optical flow from frame t-1 to t (SLAM resolution)
+        depth: (1, H, W) or (H, W) depth at frame t-1 (SLAM resolution)
+        intrinsics: (3, 3) camera intrinsic matrix (SLAM resolution)
+        confidence_threshold: min |flow| (SLAM pixels) to include a pixel
         depth_min, depth_max: valid depth range (endoscopy: ~0.001 to ~10 m)
-        debug: if True, print PnP diagnostics
+        irls_iters: number of IRLS iterations (typically 5)
+        cauchy_c: Cauchy robust scale (pixels); residuals >> c are down-weighted
+        max_pixels: subsampling cap; deterministic stride sample if exceeded
+        translation_gate: reject if ||rho|| > this (meters); fallback to CV
+        rotation_gate: reject if ||theta|| > this (radians); fallback to CV
+        debug: if True, print solver diagnostics
 
     Returns:
-        params: updated with initial pose estimate for time_idx
-        success: bool, whether PnP succeeded
+        params: updated with initial pose estimate for time_idx (or unchanged)
+        success: bool, whether the IRLS solve passed sanity gates
     """
     if flow is None or time_idx < 1:
         return params, False
@@ -110,105 +241,119 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
     # Compute flow magnitude for confidence filtering
     flow_mag = np.sqrt(flow[:, :, 0] ** 2 + flow[:, :, 1] ** 2)
 
-    # Valid points: positive depth + sufficient flow
+    # Valid pixels: positive depth + sufficient flow
     valid_mask = (depth_np > depth_min) & (depth_np < depth_max) & (flow_mag > confidence_threshold)
     valid_ys, valid_xs = np.where(valid_mask)
+    n_valid = len(valid_ys)
 
     if debug:
         print(f"[flow_init t={time_idx}] depth range=[{depth_np.min():.4f}, "
               f"{depth_np.max():.4f}], flow_mag mean={flow_mag.mean():.3f}, "
-              f"valid points={len(valid_ys)}")
+              f"valid pixels={n_valid}")
 
-    if len(valid_ys) < 10:
+    if n_valid < 50:
         if debug:
-            print(f"[flow_init t={time_idx}] too few valid points -> skip")
+            print(f"[flow_init t={time_idx}] too few valid pixels -> fallback")
         return params, False
 
-    # Sample points DETERMINISTICALLY (seeded by time_idx for reproducibility)
-    n_sample = min(n_points, len(valid_ys))
-    rng = np.random.default_rng(int(time_idx))
-    indices = rng.choice(len(valid_ys), n_sample, replace=False)
-    ys = valid_ys[indices]
-    xs = valid_xs[indices]
+    # Deterministic stride subsampling (no randomness)
+    if n_valid > max_pixels:
+        stride = int(np.ceil(n_valid / max_pixels))
+        ys = valid_ys[::stride]
+        xs = valid_xs[::stride]
+    else:
+        ys = valid_ys
+        xs = valid_xs
+    n_used = len(ys)
 
     # Intrinsics
-    K = intrinsics.cpu().numpy() if isinstance(intrinsics, torch.Tensor) else intrinsics
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
+    K_np = intrinsics.cpu().numpy() if isinstance(intrinsics, torch.Tensor) else intrinsics
+    fx = float(K_np[0, 0])
+    fy = float(K_np[1, 1])
+    cx = float(K_np[0, 2])
+    cy = float(K_np[1, 2])
 
-    # 3D points in frame t-1 (camera coordinates)
-    z = depth_np[ys, xs]
-    x3d = (xs - cx) * z / fx
-    y3d = (ys - cy) * z / fy
-    pts_3d = np.stack([x3d, y3d, z], axis=1).astype(np.float64)  # (N, 3)
+    # Move sampled data to torch/CUDA for solve
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32
 
-    # 2D points in frame t (pixel coordinates after flow)
-    u_t = xs + flow[ys, xs, 0]
-    v_t = ys + flow[ys, xs, 1]
-    pts_2d = np.stack([u_t, v_t], axis=1).astype(np.float64)  # (N, 2)
+    Z = torch.from_numpy(depth_np[ys, xs]).to(device=device, dtype=dtype)
+    # Centered pixel coordinates for the projective image Jacobian (Eq. 2)
+    u_c = torch.from_numpy(xs.astype(np.float32) - cx).to(device=device, dtype=dtype)
+    v_c = torch.from_numpy(ys.astype(np.float32) - cy).to(device=device, dtype=dtype)
 
-    # Solve PnP (RANSAC for robustness)
-    K_cv = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        pts_3d, pts_2d, K_cv, None,
-        iterationsCount=200,
-        reprojectionError=3.0,
-        confidence=0.99,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
+    # Flow vectors stacked as [F_u, F_v] interleaved per pixel: (2N,)
+    Fu = torch.from_numpy(flow[ys, xs, 0].astype(np.float32)).to(device=device, dtype=dtype)
+    Fv = torch.from_numpy(flow[ys, xs, 1].astype(np.float32)).to(device=device, dtype=dtype)
+    F_stack = torch.stack([Fu, Fv], dim=1).reshape(2 * n_used)  # (2N,)
 
-    if not success or inliers is None or len(inliers) < 5:
+    # Build the (2N, 6) image Jacobian
+    J = _build_image_jacobian(u_c, v_c, Z, fx, fy)  # (2N, 6)
+
+    # IRLS: initialize weights uniformly
+    W_stack = torch.ones(2 * n_used, device=device, dtype=dtype)
+    xi = torch.zeros(6, device=device, dtype=dtype)
+    final_residual_rms = float("inf")
+
+    eps = 1e-8
+    for irls_step in range(irls_iters):
+        # Weighted normal equations: (J^T W J) xi = J^T W F
+        WJ = W_stack[:, None] * J          # (2N, 6)
+        A = J.t() @ WJ                     # (6, 6)
+        b = J.t() @ (W_stack * F_stack)    # (6,)
+        # Tiny ridge for numerical stability on degenerate scenes
+        A = A + eps * torch.eye(6, device=device, dtype=dtype)
+        try:
+            xi = torch.linalg.solve(A, b)
+        except RuntimeError:
+            if debug:
+                print(f"[flow_init t={time_idx}] IRLS solve failed at iter "
+                      f"{irls_step} -> fallback")
+            return params, False
+
+        # Residuals and Cauchy weights for next iter
+        F_pred = J @ xi                    # (2N,)
+        r = F_stack - F_pred               # (2N,)
+        W_stack = 1.0 / (1.0 + (r / cauchy_c) ** 2)
+        final_residual_rms = float(torch.sqrt((r * r).mean()).item())
+
+    rho = xi[:3]
+    theta = xi[3:]
+    rho_norm = float(torch.linalg.norm(rho).item())
+    theta_norm = float(torch.linalg.norm(theta).item())
+
+    # Sanity gates -- reject obviously broken solutions
+    if rho_norm > translation_gate or theta_norm > rotation_gate:
         if debug:
-            n_in = 0 if inliers is None else len(inliers)
-            print(f"[flow_init t={time_idx}] PnP failed (success={success}, "
-                  f"inliers={n_in}) -> fallback")
+            print(f"[flow_init t={time_idx}] sanity gate FAIL "
+                  f"(|rho|={rho_norm:.4f}, |theta|={theta_norm:.4f}, "
+                  f"rms={final_residual_rms:.3f}) -> fallback")
         return params, False
 
     if debug:
-        print(f"[flow_init t={time_idx}] PnP OK: inliers={len(inliers)}/{n_sample}, "
-              f"|rvec|={np.linalg.norm(rvec):.4f}, |tvec|={np.linalg.norm(tvec):.4f}")
+        print(f"[flow_init t={time_idx}] IRLS OK: used={n_used}, "
+              f"rms={final_residual_rms:.3f}, |rho|={rho_norm:.4f}, "
+              f"|theta|={theta_norm:.4f}")
 
-    # Convert to rotation matrix
-    R, _ = cv2.Rodrigues(rvec)
-
-    # Construct relative w2c from frame t-1 to frame t
-    # PnP gives us the pose of frame t in the frame t-1 coordinate system
-    # We need to compose with the previous frame's pose to get world-to-camera
-    # Actually, since our SLAM stores per-frame w2c directly:
-    # The relative transformation is R_rel, t_rel
-    # new_w2c = R_rel @ prev_w2c (for the rotation part)
-
-    # For simplicity in our framework: use the PnP result as a relative transform
-    # and compose with the previous frame's estimated pose
-
+    # Build T_rel from twist and compose with previous w2c
     from utils.slam_external import build_rotation
+    from utils.slam_helpers import matrix_to_quaternion
 
     with torch.no_grad():
-        # Get previous pose
+        T_rel = _exp_se3(xi)               # (4, 4)
+
         prev_rot = F.normalize(params["cam_unnorm_rots"][..., time_idx - 1].detach())
         prev_tran = params["cam_trans"][..., time_idx - 1].detach()
-
-        # Previous w2c matrix
-        prev_w2c = torch.eye(4).cuda().float()
+        prev_w2c = torch.eye(4, dtype=dtype, device=device)
         prev_w2c[:3, :3] = build_rotation(prev_rot)
         prev_w2c[:3, 3] = prev_tran
 
-        # Relative transform from PnP
-        R_rel = torch.from_numpy(R).float().cuda()
-        t_rel = torch.from_numpy(tvec.squeeze()).float().cuda()
-        rel_transform = torch.eye(4).cuda().float()
-        rel_transform[:3, :3] = R_rel
-        rel_transform[:3, 3] = t_rel
+        # new_w2c = T_rel @ prev_w2c  (flow is t-1 -> t, so T_rel = T(t <- t-1))
+        new_w2c = T_rel @ prev_w2c
 
-        # New w2c = relative @ previous
-        new_w2c = rel_transform @ prev_w2c
-
-        # Extract quaternion from new rotation
-        from utils.slam_helpers import matrix_to_quaternion
         new_rot_quat = matrix_to_quaternion(new_w2c[:3, :3].unsqueeze(0))
         new_tran = new_w2c[:3, 3]
 
-        # Set initial pose
         params["cam_unnorm_rots"][..., time_idx] = new_rot_quat.detach()
         params["cam_trans"][..., time_idx] = new_tran.detach()
 

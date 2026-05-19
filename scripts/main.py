@@ -909,9 +909,16 @@ def rgbd_slam(config: dict):
                     # (frame t-1), not current frame's depth. Load it from dataset.
                     _, prev_depth_raw, _, _ = dataset[time_idx - 1]
                     prev_depth = prev_depth_raw.permute(2, 0, 1)
+                    # Flow4DGS-style IRLS twist solver -- configurable via
+                    # innovation_cfg (sane defaults baked into the function).
                     params, flow_init_success = flow_guided_pose_init(
                         params, time_idx, flow_data, prev_depth, intrinsics,
                         confidence_threshold=flow_conf_thresh,
+                        irls_iters=innovation_cfg.get("flow_init_irls_iters", 5),
+                        cauchy_c=innovation_cfg.get("flow_init_cauchy_c", 1.0),
+                        max_pixels=innovation_cfg.get("flow_init_max_pixels", 50000),
+                        translation_gate=innovation_cfg.get("flow_init_translation_gate", 0.1),
+                        rotation_gate=innovation_cfg.get("flow_init_rotation_gate", 0.1),
                         debug=debug_flow,
                     )
 
