@@ -921,6 +921,7 @@ def rgbd_slam(config: dict):
                         rotation_gate=innovation_cfg.get("flow_init_rotation_gate", 0.1),
                         neg_xi=innovation_cfg.get("flow_init_neg_xi", False),
                         invert_T=innovation_cfg.get("flow_init_invert_T", False),
+                        cv_disagree_max=innovation_cfg.get("flow_init_cv_disagree_max", 0.0),
                         debug=debug_flow,
                     )
 

@@ -181,6 +181,7 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
                           max_pixels=50000,
                           translation_gate=0.1, rotation_gate=0.1,
                           neg_xi=False, invert_T=False,
+                          cv_disagree_max=0.0,
                           debug=False):
     """
     Estimate initial camera pose via Flow4DGS-style linearized twist solver.
@@ -366,24 +367,40 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
         prev_w2c[:3, :3] = build_rotation(prev_rot)
         prev_w2c[:3, 3] = prev_tran
 
-        if debug and time_idx >= 2:
-            # Compare to constant-velocity prediction
-            prev_tran2 = params["cam_trans"][..., time_idx - 2].detach()
-            cv_delta = (prev_tran - prev_tran2).cpu().numpy().astype(float).flatten()
-            irls_delta_cam = T_rel[:3, 3].cpu().numpy().astype(float).flatten()
-            cv_norm = float(np.linalg.norm(cv_delta))
-            print(f"[flow_init t={time_idx}] cv_delta_world="
-                  f"({float(cv_delta[0]):+.3f},{float(cv_delta[1]):+.3f},{float(cv_delta[2]):+.3f}) "
-                  f"|cv|={cv_norm:.3f}; "
-                  f"irls_t_cam="
-                  f"({float(irls_delta_cam[0]):+.3f},{float(irls_delta_cam[1]):+.3f},{float(irls_delta_cam[2]):+.3f})",
-                  flush=True)
-
         # new_w2c = T_rel @ prev_w2c  (flow is t-1 -> t, so T_rel = T(t <- t-1))
         new_w2c = T_rel @ prev_w2c
+        new_tran = new_w2c[:3, 3]
+
+        # CV-agreement gate: compare the IRLS-derived world-frame delta against
+        # the constant-velocity prediction. Reject if too disparate.
+        if time_idx >= 2:
+            prev_tran2 = params["cam_trans"][..., time_idx - 2].detach()
+            cv_delta = (prev_tran - prev_tran2).cpu().numpy().astype(float).flatten()
+            irls_delta_world = (new_tran - prev_tran).cpu().numpy().astype(float).flatten()
+            cv_norm = float(np.linalg.norm(cv_delta))
+            irls_norm = float(np.linalg.norm(irls_delta_world))
+            disagree = float(np.linalg.norm(irls_delta_world - cv_delta))
+
+            if debug:
+                print(f"[flow_init t={time_idx}] "
+                      f"cv_dw=({float(cv_delta[0]):+.3f},{float(cv_delta[1]):+.3f},{float(cv_delta[2]):+.3f}) "
+                      f"|cv|={cv_norm:.3f} | "
+                      f"irls_dw=({float(irls_delta_world[0]):+.3f},{float(irls_delta_world[1]):+.3f},{float(irls_delta_world[2]):+.3f}) "
+                      f"|irls|={irls_norm:.3f} | disagree={disagree:.3f}",
+                      flush=True)
+
+            # If IRLS disagrees with CV by more than cv_disagree_max, reject.
+            # Skip the gate for the very first few frames where CV itself is unreliable.
+            cv_disagree_max_local = cv_disagree_max
+            if cv_disagree_max_local > 0 and time_idx >= 3:
+                if disagree > cv_disagree_max_local:
+                    if debug:
+                        print(f"[flow_init t={time_idx}] CV-DISAGREE gate FAIL "
+                              f"(disagree={disagree:.3f} > {cv_disagree_max_local}) -> fallback",
+                              flush=True)
+                    return params, False
 
         new_rot_quat = matrix_to_quaternion(new_w2c[:3, :3].unsqueeze(0))
-        new_tran = new_w2c[:3, 3]
 
         params["cam_unnorm_rots"][..., time_idx] = new_rot_quat.detach()
         params["cam_trans"][..., time_idx] = new_tran.detach()
