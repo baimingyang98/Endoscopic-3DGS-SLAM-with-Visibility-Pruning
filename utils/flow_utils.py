@@ -369,13 +369,14 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
         if debug and time_idx >= 2:
             # Compare to constant-velocity prediction
             prev_tran2 = params["cam_trans"][..., time_idx - 2].detach()
-            cv_delta = (prev_tran - prev_tran2).cpu().numpy()
-            irls_delta_cam = T_rel[:3, 3].cpu().numpy()  # translation in cam frame
+            cv_delta = (prev_tran - prev_tran2).cpu().numpy().astype(float).flatten()
+            irls_delta_cam = T_rel[:3, 3].cpu().numpy().astype(float).flatten()
+            cv_norm = float(np.linalg.norm(cv_delta))
             print(f"[flow_init t={time_idx}] cv_delta_world="
-                  f"({cv_delta[0]:+.3f},{cv_delta[1]:+.3f},{cv_delta[2]:+.3f}) "
-                  f"|cv|={float(np.linalg.norm(cv_delta)):.3f}; "
+                  f"({float(cv_delta[0]):+.3f},{float(cv_delta[1]):+.3f},{float(cv_delta[2]):+.3f}) "
+                  f"|cv|={cv_norm:.3f}; "
                   f"irls_t_cam="
-                  f"({irls_delta_cam[0]:+.3f},{irls_delta_cam[1]:+.3f},{irls_delta_cam[2]:+.3f})",
+                  f"({float(irls_delta_cam[0]):+.3f},{float(irls_delta_cam[1]):+.3f},{float(irls_delta_cam[2]):+.3f})",
                   flush=True)
 
         # new_w2c = T_rel @ prev_w2c  (flow is t-1 -> t, so T_rel = T(t <- t-1))
