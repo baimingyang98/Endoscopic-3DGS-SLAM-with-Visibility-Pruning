@@ -1314,6 +1314,7 @@ def rgbd_slam(config: dict):
         refine_stage1_iters = innovation_cfg.get("refine_stage1_iters", 100)
         refine_stage2_iters = innovation_cfg.get("refine_stage2_iters", 500)
         refine_all_frames = innovation_cfg.get("refine_all_frames", True)
+        refine_lambda_lpips = innovation_cfg.get("refine_lambda_lpips", 0.0)
         # Refinement-specific loss weights. Defaults emphasize photometric
         # quality (im weight up) while keeping depth as a geometry anchor.
         # SSIM is ALREADY included inside get_loss for mapping branch
@@ -1371,25 +1372,47 @@ def rgbd_slam(config: dict):
         sorted_indices = np.argsort(frame_psnrs)
 
         refine_optimizer = initialize_optimizer(params, refine_lrs)
-        refine_bar = tqdm(range(len(refine_pool) * refine_stage1_iters), desc="  Refine S1")
 
+        # Optional LPIPS perceptual loss for refinement
+        lpips_loss_fn = None
+        if refine_lambda_lpips > 0:
+            import lpips as _lpips_mod
+            lpips_loss_fn = _lpips_mod.LPIPS(net="alex").cuda()
+            for p in lpips_loss_fn.parameters():
+                p.requires_grad = False
+            print(f"  LPIPS perceptual loss enabled (lambda={refine_lambda_lpips})")
+
+        def _refine_step(f_data, time_id, gt_im):
+            loss_r, _, _ = get_loss(
+                params, f_data, variables, time_id,
+                refine_loss_weights,
+                config["mapping"]["use_sil_for_loss"],
+                config["mapping"]["sil_thres"],
+                config["mapping"]["use_l1"],
+                config["mapping"]["ignore_outlier_depth_loss"],
+                mapping=True,
+            )
+            if lpips_loss_fn is not None:
+                # Render again to get a differentiable RGB for LPIPS
+                tp = transform_to_frame(params, time_id, gaussians_grad=True, camera_grad=False)
+                rv = transformed_params2rendervar(params, tp)
+                im_render = Renderer(raster_settings=cam)(**rv)[0]
+                # LPIPS expects [-1, 1] range, (N, 3, H, W)
+                im_n = (im_render.clamp(0, 1) * 2 - 1).unsqueeze(0)
+                gt_n = (gt_im.clamp(0, 1) * 2 - 1).unsqueeze(0)
+                lp = lpips_loss_fn(im_n, gt_n).mean()
+                loss_r = loss_r + refine_lambda_lpips * lp
+            loss_r.backward()
+            refine_optimizer.step()
+            refine_optimizer.zero_grad(set_to_none=True)
+
+        refine_bar = tqdm(range(len(refine_pool) * refine_stage1_iters), desc="  Refine S1")
         for rank in sorted_indices:
             f = refine_pool[rank]
             f_data = {"cam": cam, "im": f["color"], "depth": f["depth"],
                       "id": f["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
             for _ in range(refine_stage1_iters):
-                loss_r, _, _ = get_loss(
-                    params, f_data, variables, f["id"],
-                    refine_loss_weights,
-                    config["mapping"]["use_sil_for_loss"],
-                    config["mapping"]["sil_thres"],
-                    config["mapping"]["use_l1"],
-                    config["mapping"]["ignore_outlier_depth_loss"],
-                    mapping=True,
-                )
-                loss_r.backward()
-                refine_optimizer.step()
-                refine_optimizer.zero_grad(set_to_none=True)
+                _refine_step(f_data, f["id"], f["color"])
                 refine_bar.update(1)
         refine_bar.close()
 
@@ -1400,18 +1423,7 @@ def rgbd_slam(config: dict):
             rand_f = refine_pool[np.random.randint(0, len(refine_pool))]
             f_data = {"cam": cam, "im": rand_f["color"], "depth": rand_f["depth"],
                       "id": rand_f["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
-            loss_r, _, _ = get_loss(
-                params, f_data, variables, rand_f["id"],
-                refine_loss_weights,
-                config["mapping"]["use_sil_for_loss"],
-                config["mapping"]["sil_thres"],
-                config["mapping"]["use_l1"],
-                config["mapping"]["ignore_outlier_depth_loss"],
-                mapping=True,
-            )
-            loss_r.backward()
-            refine_optimizer.step()
-            refine_optimizer.zero_grad(set_to_none=True)
+            _refine_step(f_data, rand_f["id"], rand_f["color"])
             refine_bar2.update(1)
         refine_bar2.close()
         print("  Refinement complete.")
