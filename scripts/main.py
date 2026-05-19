@@ -1313,11 +1313,18 @@ def rgbd_slam(config: dict):
         print("\n=== Post-SLAM Refinement ===")
         refine_stage1_iters = innovation_cfg.get("refine_stage1_iters", 100)
         refine_stage2_iters = innovation_cfg.get("refine_stage2_iters", 500)
-        refine_lambda_dssim = innovation_cfg.get("refine_lambda_dssim", 0.2)
-        # refine_all_frames: if True, refine over ALL train frames (not just
-        # keyframes). EndoFlow-style: their +4dB refinement gain comes from
-        # touching every frame, not just 1/keyframe_every of them.
         refine_all_frames = innovation_cfg.get("refine_all_frames", True)
+        # Refinement-specific loss weights. Defaults emphasize photometric
+        # quality (im weight up) while keeping depth as a geometry anchor.
+        # SSIM is ALREADY included inside get_loss for mapping branch
+        # (0.8*L1 + 0.2*(1-SSIM)); we do NOT add it externally here.
+        refine_im_weight = innovation_cfg.get("refine_im_weight", 1.0)
+        refine_depth_weight = innovation_cfg.get("refine_depth_weight", 0.1)
+
+        refine_loss_weights = {
+            "im": refine_im_weight,
+            "depth": refine_depth_weight,
+        }
 
         # Create optimizer for Gaussians only (no camera pose updates)
         refine_lrs = {k: config["mapping"]["lrs"].get(k, 0.0) for k in params.keys()
@@ -1325,8 +1332,7 @@ def rgbd_slam(config: dict):
         refine_lrs["cam_unnorm_rots"] = 0.0
         refine_lrs["cam_trans"] = 0.0
 
-        # Build the refinement frame pool: either all train frames or only kfs.
-        # Each entry: {"id": int, "color": (3,H,W) cuda, "depth": (1,H,W) cuda}
+        # Build the refinement frame pool
         if refine_all_frames:
             print(f"  Building refinement pool from ALL {num_frames} train frames...")
             refine_pool = []
@@ -1337,11 +1343,11 @@ def rgbd_slam(config: dict):
                 refine_pool.append({"id": t_idx, "color": rc, "depth": rd})
         else:
             refine_pool = keyframe_list
-        print(f"  Refinement pool size: {len(refine_pool)} frames")
+        print(f"  Refinement pool size: {len(refine_pool)} frames "
+              f"| im_w={refine_im_weight} depth_w={refine_depth_weight}")
 
         # Stage 1: Per-frame refinement (worst-quality first)
         print(f"  Stage 1: Refining {len(refine_pool)} frames ({refine_stage1_iters} iters each)...")
-        # Compute current PSNR per frame to rank them
         frame_psnrs = []
         with torch.no_grad():
             for f in refine_pool:
@@ -1352,11 +1358,9 @@ def rgbd_slam(config: dict):
                 f_psnr = -10 * torch.log10(((f_im - f["color"]) ** 2).mean())
                 frame_psnrs.append(f_psnr.item())
 
-        # Sort by PSNR (worst first)
         sorted_indices = np.argsort(frame_psnrs)
 
         refine_optimizer = initialize_optimizer(params, refine_lrs)
-        from utils.slam_external import calc_ssim as refine_ssim
         refine_bar = tqdm(range(len(refine_pool) * refine_stage1_iters), desc="  Refine S1")
 
         for rank in sorted_indices:
@@ -1366,21 +1370,13 @@ def rgbd_slam(config: dict):
             for _ in range(refine_stage1_iters):
                 loss_r, _, _ = get_loss(
                     params, f_data, variables, f["id"],
-                    config["mapping"]["loss_weights"],
+                    refine_loss_weights,
                     config["mapping"]["use_sil_for_loss"],
                     config["mapping"]["sil_thres"],
                     config["mapping"]["use_l1"],
                     config["mapping"]["ignore_outlier_depth_loss"],
                     mapping=True,
                 )
-                # Add DSSIM term for structural preservation
-                f_transformed = transform_to_frame(params, f["id"], gaussians_grad=True, camera_grad=False)
-                f_rendervar = transformed_params2rendervar(params, f_transformed)
-                f_out = Renderer(raster_settings=cam)(**f_rendervar)
-                f_im_r = f_out[0]
-                dssim = 1.0 - refine_ssim(f_im_r, f["color"])
-                loss_r = (1 - refine_lambda_dssim) * loss_r + refine_lambda_dssim * dssim
-
                 loss_r.backward()
                 refine_optimizer.step()
                 refine_optimizer.zero_grad(set_to_none=True)
@@ -1396,7 +1392,7 @@ def rgbd_slam(config: dict):
                       "id": rand_f["id"], "intrinsics": intrinsics, "w2c": first_frame_w2c}
             loss_r, _, _ = get_loss(
                 params, f_data, variables, rand_f["id"],
-                config["mapping"]["loss_weights"],
+                refine_loss_weights,
                 config["mapping"]["use_sil_for_loss"],
                 config["mapping"]["sil_thres"],
                 config["mapping"]["use_l1"],
