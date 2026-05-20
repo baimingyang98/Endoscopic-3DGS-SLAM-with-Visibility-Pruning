@@ -131,6 +131,30 @@ def _build_image_jacobian(u_c, v_c, Z, fx, fy):
     return J
 
 
+def _compute_rigidity_mask(flow_uv, kernel_size=7, threshold=3.0):
+    """
+    Return a boolean mask (H, W) marking pixels where optical flow is locally coherent.
+
+    Locally incoherent flow (where a pixel's flow deviates from its neighborhood
+    mean by more than `threshold` pixels) indicates non-rigid tissue deformation.
+    These pixels should be excluded from rigid-scene pose estimation.
+
+    Args:
+        flow_uv: (H, W, 2) optical flow array (numpy float32)
+        kernel_size: blur kernel size for local mean (must be odd)
+        threshold: max deviation from local mean (pixels) to be considered rigid
+
+    Returns:
+        rigid_mask: (H, W) bool numpy array, True = locally rigid / coherent
+    """
+    fx = flow_uv[:, :, 0].astype(np.float32)
+    fy = flow_uv[:, :, 1].astype(np.float32)
+    mean_fx = cv2.blur(fx, (kernel_size, kernel_size))
+    mean_fy = cv2.blur(fy, (kernel_size, kernel_size))
+    deviation = np.sqrt((fx - mean_fx) ** 2 + (fy - mean_fy) ** 2)
+    return deviation < threshold
+
+
 # ============================================================
 # Flow-Guided Pose Initialization
 # ============================================================
@@ -182,6 +206,7 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
                           translation_gate=0.1, rotation_gate=0.1,
                           neg_xi=False, invert_T=False,
                           cv_disagree_max=0.0,
+                          rigidity_kernel=0, rigidity_threshold=3.0,
                           debug=False):
     """
     Estimate initial camera pose via Flow4DGS-style linearized twist solver.
@@ -246,6 +271,13 @@ def flow_guided_pose_init(params, time_idx, flow, depth, intrinsics,
 
     # Valid pixels: positive depth + sufficient flow
     valid_mask = (depth_np > depth_min) & (depth_np < depth_max) & (flow_mag > confidence_threshold)
+
+    # Rigidity mask: exclude pixels where flow is locally incoherent (deforming tissue).
+    # kernel_size=0 disables this check (backward-compatible default).
+    if rigidity_kernel > 0:
+        rigid_mask = _compute_rigidity_mask(flow, rigidity_kernel, rigidity_threshold)
+        valid_mask = valid_mask & rigid_mask
+
     valid_ys, valid_xs = np.where(valid_mask)
     n_valid = len(valid_ys)
 
@@ -531,11 +563,21 @@ def compute_flow_loss(params, time_idx_a, time_idx_b, gt_flow, cam_settings,
     gt_fu = sampled_flow[0, 0, :, 0]  # (K,)
     gt_fv = sampled_flow[0, 1, :, 0]  # (K,)
 
-    # Compute L2 loss between Gaussian flow and GT optical flow
+    # Compute opacity-weighted L2 loss between Gaussian flow and RAFT GT flow.
+    # High-opacity (stable, mature) Gaussians dominate: they represent well-established
+    # rigid structure. Low-opacity Gaussians (freshly added in deforming tissue) get
+    # minimal weight, preventing RAFT's deformation signal from drifting the map.
     gs_fu = gs_flow_u[in_bounds]
     gs_fv = gs_flow_v[in_bounds]
 
-    flow_loss = torch.mean((gs_fu - gt_fu) ** 2 + (gs_fv - gt_fv) ** 2)
+    opacities_all = torch.sigmoid(params["logit_opacities"].squeeze())
+    if top_idx is not None:
+        w = opacities_all[top_idx][valid][in_bounds]
+    else:
+        w = opacities_all[valid][in_bounds]
+    w = w.detach()
+    w = w / (w.sum() + 1e-8)
+    flow_loss = torch.sum(w * ((gs_fu - gt_fu) ** 2 + (gs_fv - gt_fv) ** 2))
 
     if debug:
         with torch.no_grad():

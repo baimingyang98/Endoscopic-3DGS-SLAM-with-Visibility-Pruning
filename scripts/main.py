@@ -922,6 +922,8 @@ def rgbd_slam(config: dict):
                         neg_xi=innovation_cfg.get("flow_init_neg_xi", False),
                         invert_T=innovation_cfg.get("flow_init_invert_T", False),
                         cv_disagree_max=innovation_cfg.get("flow_init_cv_disagree_max", 0.0),
+                        rigidity_kernel=innovation_cfg.get("flow_init_rigidity_kernel", 0),
+                        rigidity_threshold=innovation_cfg.get("flow_init_rigidity_threshold", 3.0),
                         debug=debug_flow,
                     )
 
