@@ -138,12 +138,14 @@ config = dict(
         enable_tvs_pruning=False,       # Master switch for TVS soft pruning
         tvs_aggregation="uniform",      # "uniform" (circular-buffer mean) or "ema" (exp. moving avg)
         tvs_buffer_size=15,             # W: circular buffer size in frames (uniform mode only)
-        tvs_ema_lambda=0.0667,          # EMA rate (ema mode only); 1/15 matches uniform W=15
+        tvs_ema_lambda=0.18,            # EMA rate (ema mode); 0.18 ~ steady-state-matched to uniform W=15
         tvs_opacity_floor=0.01,         # Min opacity after degeneration (prevents hard removal)
         tvs_beta=0.1,                   # Volume penalty exponent: gamma = (1 - V_norm)^beta
         tvs_tau_sig=0.05,               # Significance midpoint: TVS=tau_sig -> decay=0.5
         tvs_temperature=1.0,            # Transition width in log-space for the Gumbel-sigmoid gate
         tvs_min_obs=50,                 # Maturation gate: min observed frames before TVS-eligible
+        tvs_degenerate_every=1,         # Run degeneration every N frames (1=every frame; raise to dampen compounding)
+        tvs_log_every=0,                # Print TVS distribution every N frames (0=disabled)
         eta_spatial=0.9,                # Spatial floater mild decay factor (multiplicative)
         enable_spatial_mask=False,      # Toggle spatial floater detection (depth-based)
         distance_gamma=0.5,             # Depth-diff threshold (meters) for spatial floater mask

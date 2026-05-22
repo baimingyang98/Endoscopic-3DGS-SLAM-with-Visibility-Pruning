@@ -1139,17 +1139,53 @@ def rgbd_slam(config: dict):
             # (after mapping optimizer is done — no optimizer state corruption)
             innovation_cfg = config.get("innovations", {})
             if innovation_cfg.get("enable_tvs_pruning", False):
-                from utils.slam_external import tvs_degenerate_between_frames
-                # Get transformed pts for spatial mask (if enabled)
-                degen_pts = None
-                if innovation_cfg.get("enable_spatial_mask", True):
-                    degen_pts = transform_to_frame(
-                        params, time_idx, gaussians_grad=False, camera_grad=False
+                # Frequency knob: only degenerate every N frames to avoid
+                # per-frame compounding (decay=0.5 every frame -> floor in ~5 frames).
+                # Default 1 preserves prior behavior.
+                degen_every = int(innovation_cfg.get("tvs_degenerate_every", 1))
+                tvs_log_every = int(innovation_cfg.get("tvs_log_every", 0))  # 0 = disabled
+
+                if degen_every > 0 and (time_idx % degen_every == 0):
+                    from utils.slam_external import tvs_degenerate_between_frames, compute_tvs
+                    # Optional: log TVS distribution before degeneration
+                    if tvs_log_every > 0 and (time_idx % tvs_log_every == 0):
+                        if "vis_history" in variables and "vis_frame_count" in variables:
+                            with torch.no_grad():
+                                tvs_dbg = compute_tvs(variables, params, innovation_cfg)
+                                m_min = innovation_cfg.get("tvs_min_obs", 50)
+                                mature_dbg = variables["vis_frame_count"][: tvs_dbg.shape[0]] > m_min
+                                tau = innovation_cfg.get("tvs_tau_sig", 0.05)
+                                if mature_dbg.any():
+                                    tm = tvs_dbg[mature_dbg]
+                                    qs = torch.quantile(
+                                        tm,
+                                        torch.tensor([0.05, 0.25, 0.50, 0.75, 0.95], device=tm.device),
+                                    )
+                                    n_below = (tm < tau).sum().item()
+                                    print(
+                                        f"[TVS f{time_idx}] N_mat={tm.numel()} "
+                                        f"N_total={tvs_dbg.numel()} "
+                                        f"min={tm.min():.4f} max={tm.max():.4f} "
+                                        f"p05={qs[0]:.4f} p25={qs[1]:.4f} p50={qs[2]:.4f} "
+                                        f"p75={qs[3]:.4f} p95={qs[4]:.4f} "
+                                        f"below_tau({tau})={n_below}/{tm.numel()} "
+                                        f"({100.0*n_below/max(tm.numel(),1):.1f}%)"
+                                    )
+                                else:
+                                    print(f"[TVS f{time_idx}] no mature Gaussians yet (N={tvs_dbg.numel()})")
+
+                    # Get transformed pts for spatial mask (if enabled)
+                    degen_pts = None
+                    if innovation_cfg.get("enable_spatial_mask", True):
+                        degen_pts = transform_to_frame(
+                            params, time_idx, gaussians_grad=False, camera_grad=False
+                        )
+                    params, n_degen = tvs_degenerate_between_frames(
+                        params, variables, innovation_cfg,
+                        curr_data=curr_data, transformed_pts=degen_pts,
                     )
-                params, n_degen = tvs_degenerate_between_frames(
-                    params, variables, innovation_cfg,
-                    curr_data=curr_data, transformed_pts=degen_pts,
-                )
+                    if tvs_log_every > 0 and (time_idx % tvs_log_every == 0):
+                        print(f"[TVS f{time_idx}] n_degenerated={n_degen}")
 
             # Innovation 2: Periodic Bundle Adjustment
             innovation_cfg = config.get("innovations", {})
