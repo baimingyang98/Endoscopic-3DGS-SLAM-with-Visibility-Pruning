@@ -8,10 +8,8 @@ Ablation configs:
   - Baseline parity:   all innovations OFF, gaussian_simplification=True, 15+25 iters
   - A1 (TVS only):     enable_tvs_pruning=True, all others OFF
   - A2 (TVS+spatial):  A1 + enable_spatial_mask=True
-  - A3 (Flow init):    enable_flow_init=True, all others OFF
-  - A4 (Flow loss):    enable_flow_loss=True, all others OFF
-  - A5 (Full 3DGS):    gaussian_simplification=False, all innovations OFF
-  - A6 (Refinement):   enable_refinement=True, all others OFF
+  - A3 (Full 3DGS):    gaussian_simplification=False, all innovations OFF
+  - A4 (Refinement):   enable_refinement=True, all others OFF
   - Full system:       everything ON, gaussian_simplification=False, 30+50 iters
 """
 import os
@@ -170,13 +168,6 @@ config = dict(
         eta_spatial=0.9,                # Spatial floater mild decay factor
         enable_spatial_mask=True,       # Toggle spatial floater detection
         distance_gamma=0.5,             # Depth diff threshold for spatial mask
-
-        # --- Optical Flow ---
-        enable_flow_init=True,          # Flow-guided pose initialization
-        enable_flow_loss=True,          # L_flow in mapping
-        lambda_flow=0.1,                # Weight for flow loss
-        flow_dir="flow",                # Subdirectory under scene folder
-        flow_confidence_threshold=0.5,  # Min confidence to use flow init
 
         # --- Post-SLAM Refinement ---
         enable_refinement=True,         # Two-stage post-SLAM refinement

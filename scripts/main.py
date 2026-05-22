@@ -876,60 +876,9 @@ def rgbd_slam(config: dict):
 
         num_iters_mapping = config["mapping"]["num_iters"]
 
-        # Initialize camera pose
+        # Initialize camera pose via constant-velocity model
         if time_idx > 0:
-            innovation_cfg = config.get("innovations", {})
-            flow_init_success = False
-
-            # Flow-guided pose initialization (if enabled and flow available)
-            if innovation_cfg.get("enable_flow_init", False) and time_idx >= 1:
-                flow_subdir = innovation_cfg.get("flow_dir", "flow")
-                flow_dir = os.path.join(config["data"]["basedir"], config["data"]["sequence"], flow_subdir)
-                flow_conf_thresh = innovation_cfg.get("flow_confidence_threshold", 0.5)
-                debug_flow = innovation_cfg.get("debug_flow", False)
-
-                from utils.flow_utils import load_flow, flow_guided_pose_init
-                # Flow from frame (time_idx-1) -> time_idx
-                # C3VD train split: color files are indexed 0..N (skipping every 8th).
-                # Flow was precomputed on full sequence files. We need to map SLAM's
-                # train-split index to the actual file index in the full sequence.
-                # Train frame at SLAM index i corresponds to full-sequence index:
-                #   full_idx = i + (i // 7)  [every 7 train frames, one test frame was skipped]
-                # For flow: we need the flow between full_idx(time_idx-1) and full_idx(time_idx)
-                full_idx_prev = (time_idx - 1) + ((time_idx - 1) // 7)
-                # CRITICAL: target_hw resizes flow to SLAM resolution AND rescales
-                # flow vectors. RAFT was precomputed on raw 1080x1350 but SLAM
-                # runs at 540x675; without this, PnP gets inconsistent geometry.
-                flow_data = load_flow(
-                    flow_dir, full_idx_prev,
-                    target_hw=(cam.image_height, cam.image_width),
-                )
-                if flow_data is not None:
-                    # BUG FIX: flow_guided_pose_init needs PREVIOUS frame's depth
-                    # (frame t-1), not current frame's depth. Load it from dataset.
-                    _, prev_depth_raw, _, _ = dataset[time_idx - 1]
-                    prev_depth = prev_depth_raw.permute(2, 0, 1)
-                    # Flow4DGS-style IRLS twist solver -- configurable via
-                    # innovation_cfg (sane defaults baked into the function).
-                    params, flow_init_success = flow_guided_pose_init(
-                        params, time_idx, flow_data, prev_depth, intrinsics,
-                        confidence_threshold=flow_conf_thresh,
-                        irls_iters=innovation_cfg.get("flow_init_irls_iters", 5),
-                        cauchy_c=innovation_cfg.get("flow_init_cauchy_c", 1.0),
-                        max_pixels=innovation_cfg.get("flow_init_max_pixels", 50000),
-                        translation_gate=innovation_cfg.get("flow_init_translation_gate", 0.1),
-                        rotation_gate=innovation_cfg.get("flow_init_rotation_gate", 0.1),
-                        neg_xi=innovation_cfg.get("flow_init_neg_xi", False),
-                        invert_T=innovation_cfg.get("flow_init_invert_T", False),
-                        cv_disagree_max=innovation_cfg.get("flow_init_cv_disagree_max", 0.0),
-                        rigidity_kernel=innovation_cfg.get("flow_init_rigidity_kernel", 0),
-                        rigidity_threshold=innovation_cfg.get("flow_init_rigidity_threshold", 3.0),
-                        debug=debug_flow,
-                    )
-
-            # Fallback to constant-velocity model if flow init failed or disabled
-            if not flow_init_success:
-                params = initialize_camera_pose(params, time_idx, forward_prop=config["tracking"]["forward_prop"])
+            params = initialize_camera_pose(params, time_idx, forward_prop=config["tracking"]["forward_prop"])
 
         # ----------------------------------------------------
         # TRACKING
@@ -1125,38 +1074,6 @@ def rgbd_slam(config: dict):
                     config["mapping"]["ignore_outlier_depth_loss"],
                     mapping=True,
                 )
-
-                # Optical flow loss (only for current frame — its pose is freshly
-                # tracked and reliable. Historical keyframes may have stale poses
-                # that would inject noise into Gaussian positions via flow gradients.)
-                innovation_cfg_map = config.get("innovations", {})
-                if (innovation_cfg_map.get("enable_flow_loss", False)
-                        and iter_time_idx == time_idx
-                        and time_idx > 0):
-                    flow_subdir = innovation_cfg_map.get("flow_dir", "flow")
-                    flow_dir = os.path.join(
-                        config["data"]["basedir"], config["data"]["sequence"], flow_subdir
-                    )
-                    from utils.flow_utils import load_flow, compute_flow_loss
-                    # Map train-split index to full-sequence file index for flow lookup
-                    full_idx_prev = (time_idx - 1) + ((time_idx - 1) // 7)
-                    # Resize flow to SLAM resolution + rescale flow vectors so
-                    # Gaussian-flow (in SLAM pixels) and GT flow are comparable.
-                    gt_flow = load_flow(
-                        flow_dir, full_idx_prev,
-                        target_hw=(cam.image_height, cam.image_width),
-                    )
-                    if gt_flow is not None:
-                        lambda_flow = innovation_cfg_map.get("lambda_flow", 0.1)
-                        debug_flow_loss = (
-                            innovation_cfg_map.get("debug_flow", False) and iter == 0
-                        )
-                        flow_loss = compute_flow_loss(
-                            params, time_idx - 1, time_idx,
-                            gt_flow, cam, intrinsics,
-                            debug=debug_flow_loss,
-                        )
-                        loss = loss + lambda_flow * flow_loss
 
                 loss.backward()
 
