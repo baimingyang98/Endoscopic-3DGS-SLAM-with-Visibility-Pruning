@@ -481,9 +481,15 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx,
         # so they are not eligible for visibility pruning until they have
         # been observed for `min_observations` frames.
         if "vis_history" in variables:
-            W_buf = variables["vis_history"].shape[1]
-            new_hist = torch.zeros(n_new, W_buf, device="cuda")
-            variables["vis_history"] = torch.cat([variables["vis_history"], new_hist], dim=0)
+            vh = variables["vis_history"]
+            if vh.dim() == 1:
+                # EMA mode: vis_history is (N,); extend with zeros for new Gaussians
+                new_hist = torch.zeros(n_new, device="cuda")
+            else:
+                # Uniform mode: vis_history is (N, W); extend with zero rows
+                W_buf = vh.shape[1]
+                new_hist = torch.zeros(n_new, W_buf, device="cuda")
+            variables["vis_history"] = torch.cat([vh, new_hist], dim=0)
         if "vis_frame_count" in variables:
             new_cnt = torch.zeros(n_new, device="cuda")
             variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
