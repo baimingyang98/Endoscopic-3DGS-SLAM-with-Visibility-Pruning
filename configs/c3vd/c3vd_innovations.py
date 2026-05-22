@@ -143,6 +143,7 @@ config = dict(
         tvs_beta=0.1,                   # Volume penalty exponent: gamma = (1 - V_norm)^beta
         tvs_tau_sig=0.05,               # Significance midpoint: TVS=tau_sig -> decay=0.5
         tvs_temperature=1.0,            # Transition width in log-space for the Gumbel-sigmoid gate
+        tvs_decay_floor=0.0,            # Clamp the per-frame decay multiplier from below. 0=legacy (decay can hit 0 in one frame). 0.5=max 50% reduction/frame. 0.9=max 10%/frame (mirrors eta_spatial).
         tvs_min_obs=50,                 # Maturation gate: min observed frames before TVS-eligible
         tvs_degenerate_every=1,         # Run degeneration every N frames (1=every frame; raise to dampen compounding)
         tvs_log_every=0,                # Print TVS distribution every N frames (0=disabled)

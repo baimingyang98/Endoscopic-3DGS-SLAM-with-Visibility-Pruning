@@ -623,6 +623,15 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     # This prevents hard removal (threshold=0.005) from permanently deleting
     # Gaussians that may be needed from other viewpoints.
     opacity_floor = innovation_config.get("tvs_opacity_floor", 0.01)
+    # Decay-multiplier floor: clamp `decay` from below so a single TVS hit
+    # can reduce sigma by at most (1 - decay_floor). Without this, decay
+    # collapses to ~0 when TVS<<tau_sig, driving sigma to the opacity_floor
+    # in one frame and creating a tug-of-war with the mapping optimizer
+    # (which pushes sigma back up each iteration).
+    #   decay_floor=0.0 (default): legacy behavior, decay can go to 0.
+    #   decay_floor=0.5: max 50% reduction per frame.
+    #   decay_floor=0.9: max 10% reduction per frame (mirrors eta_spatial).
+    decay_floor = float(innovation_config.get("tvs_decay_floor", 0.0))
     # Re-probation: after degeneration, reset the Gaussian's vis tracking
     # so it must re-mature (vis_frame_count > min_obs) before being judged
     # again. Breaks the V<->sigma feedback loop:
@@ -648,6 +657,8 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
         if mature.any():
             with torch.no_grad():
                 decay = gumbel_sigmoid_decay(tvs[mature], tau_sig, temperature)
+                if decay_floor > 0.0:
+                    decay = decay.clamp(min=decay_floor)
                 affected_logit = params["logit_opacities"].data[mature, 0]
                 affected_opacity = torch.sigmoid(affected_logit)
                 new_opacity = (affected_opacity * decay).clamp(opacity_floor, 1 - 1e-6)
