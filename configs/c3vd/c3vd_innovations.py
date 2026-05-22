@@ -159,7 +159,9 @@ config = dict(
     innovations=dict(
         # --- TVS-Guided Soft Pruning ---
         enable_tvs_pruning=True,        # Master switch for TVS pruning
-        tvs_buffer_size=15,             # W: circular buffer size (frames)
+        tvs_aggregation="uniform",      # "uniform" (circular buffer mean) or "ema" (exp. moving avg)
+        tvs_buffer_size=15,             # W: circular buffer size (uniform mode only)
+        tvs_ema_lambda=0.0667,          # EMA rate (ema mode only); ~1/15 matches uniform W=15
         tvs_opacity_floor=0.01,         # Min opacity after degeneration (prevents hard removal)
         tvs_beta=0.1,                   # Volume penalty exponent
         tvs_tau_sig=0.05,               # Significance midpoint (TVS=this -> decay=0.5)

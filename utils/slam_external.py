@@ -219,6 +219,13 @@ def _resize_to_N(tensor, N):
         return tensor[:N]
 
 
+def _resize_vis_any(tensor, N):
+    """Resize either a 1D (EMA mode) or 2D (uniform-buffer mode) vis tensor to N rows."""
+    if tensor.dim() == 1:
+        return _resize_1d(tensor, N)
+    return _resize_to_N(tensor, N)
+
+
 # ============================================================
 # Point removal (with innovation variable sync)
 # ============================================================
@@ -257,7 +264,7 @@ def remove_points(to_remove, params, variables, optimizer):
     # Innovation 1+3: Keep innovation variables in sync
     N = to_keep.shape[0]
     if "vis_history" in variables:
-        variables["vis_history"] = _resize_to_N(variables["vis_history"], N)[to_keep]
+        variables["vis_history"] = _resize_vis_any(variables["vis_history"], N)[to_keep]
     if "vis_frame_count" in variables:
         variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)[to_keep]
     if "deform_mask" in variables:
@@ -295,9 +302,14 @@ def compute_tvs(variables, params, innovation_config):
     """
     beta = innovation_config.get("tvs_beta", 0.1)
 
-    # Temporal mean visibility from circular buffer
-    vis_hist = variables["vis_history"]  # (N, W)
-    vis_mean = vis_hist.mean(dim=1)  # (N,)
+    # Temporal visibility aggregate:
+    #   uniform mode: vis_history is (N, W) circular buffer -> mean over buffer
+    #   EMA     mode: vis_history is (N,) running estimate  -> use directly
+    vis_hist = variables["vis_history"]
+    if vis_hist.dim() == 1:
+        vis_mean = vis_hist  # (N,)
+    else:
+        vis_mean = vis_hist.mean(dim=1)  # (N,)
 
     # Volumetric penalty: penalize large Gaussians that contribute little
     log_scales = params["log_scales"]
@@ -407,39 +419,71 @@ def compute_distance_mask(transformed_pts, curr_data, gamma=0.05):
 
 def update_vis_buffer(variables, gauss_vis, innovation_config):
     """
-    Update the per-Gaussian visibility circular buffer.
+    Update the per-Gaussian temporal visibility estimate.
 
-    Called every mapping iteration to record the latest gauss_vis from
-    the CUDA rasterizer into the rolling buffer.
+    Two aggregation modes are supported (controlled by tvs_aggregation):
+
+      - "uniform": circular buffer of size W. vis_history shape = (N, W).
+                   TVS uses the mean over the buffer.
+      - "ema":     exponential moving average with rate lambda.
+                   vis_history shape = (N,). No buffer storage needed.
+                   Effective window ~ 1/lambda (lambda=1/15 ~ uniform W=15).
+
+    Both modes share vis_frame_count (used by the maturation gate).
 
     Args:
         variables: dict (modified in-place)
         gauss_vis: (N,) per-Gaussian visibility from rasterizer
-        innovation_config: dict with 'tvs_buffer_size'
+        innovation_config: dict with 'tvs_aggregation', 'tvs_buffer_size',
+                           'tvs_ema_lambda'
 
     Returns:
         variables: updated with new visibility data
     """
     N = gauss_vis.shape[0]
-    W = innovation_config.get("tvs_buffer_size", 15)
+    mode = innovation_config.get("tvs_aggregation", "uniform")
+    gv = gauss_vis[:N].detach()
 
-    # Initialize circular buffer if needed
-    if "vis_history" not in variables:
-        variables["vis_history"] = torch.zeros(N, W, device="cuda")
-        variables["vis_frame_count"] = torch.zeros(N, device="cuda")
-        variables["vis_write_idx"] = 0
+    if mode == "ema":
+        lam = float(innovation_config.get("tvs_ema_lambda", 1.0 / 15.0))
+        lam = max(min(lam, 1.0), 1e-6)
 
-    # Resize to match current Gaussian count (after densification)
-    variables["vis_history"] = _resize_to_N(variables["vis_history"], N)
-    variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)
+        # Initialize 1D EMA tensor if needed
+        if "vis_history" not in variables or variables["vis_history"].dim() != 1:
+            variables["vis_history"] = torch.zeros(N, device="cuda")
+            variables["vis_frame_count"] = torch.zeros(N, device="cuda")
+            variables["vis_write_idx"] = 0  # unused in EMA mode, kept for compat
 
-    # Write current visibility into circular buffer
-    col = variables["vis_write_idx"] % W
-    variables["vis_history"][:N, col] = gauss_vis[:N].detach()
-    variables["vis_write_idx"] = (variables["vis_write_idx"] + 1) % W
+        # Resize to match current Gaussian count (after densification)
+        variables["vis_history"] = _resize_1d(variables["vis_history"], N)
+        variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)
+
+        # EMA update:  v_bar <- (1-lam) * v_bar + lam * v
+        variables["vis_history"][:N] = (
+            (1.0 - lam) * variables["vis_history"][:N] + lam * gv
+        )
+    else:
+        # "uniform" mode (default): circular buffer
+        W = innovation_config.get("tvs_buffer_size", 15)
+
+        # Initialize circular buffer if needed
+        if "vis_history" not in variables or variables["vis_history"].dim() != 2:
+            variables["vis_history"] = torch.zeros(N, W, device="cuda")
+            variables["vis_frame_count"] = torch.zeros(N, device="cuda")
+            variables["vis_write_idx"] = 0
+
+        # Resize to match current Gaussian count (after densification)
+        variables["vis_history"] = _resize_to_N(variables["vis_history"], N)
+        variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)
+
+        # Write current visibility into circular buffer
+        col = variables["vis_write_idx"] % W
+        variables["vis_history"][:N, col] = gv
+        variables["vis_write_idx"] = (variables["vis_write_idx"] + 1) % W
 
     # Count only Gaussians that were actually rendered (gauss_vis > 0)
-    variables["vis_frame_count"][:N] += (gauss_vis[:N] > 0).float()
+    # Shared by both modes; drives the maturation gate.
+    variables["vis_frame_count"][:N] += (gv > 0).float()
 
     return variables
 
