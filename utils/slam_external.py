@@ -623,6 +623,12 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     # This prevents hard removal (threshold=0.005) from permanently deleting
     # Gaussians that may be needed from other viewpoints.
     opacity_floor = innovation_config.get("tvs_opacity_floor", 0.01)
+    # Re-probation: after degeneration, reset the Gaussian's vis tracking
+    # so it must re-mature (vis_frame_count > min_obs) before being judged
+    # again. Breaks the V<->sigma feedback loop:
+    #   low TVS -> sigma decayed -> rasterizer culls -> V=0 -> still low TVS -> ...
+    # Without this, every mature Gaussian eventually collapses to floor.
+    reset_on_degenerate = innovation_config.get("tvs_reset_on_degenerate", True)
 
     N = params["means3D"].shape[0]
     n_degenerated = 0
@@ -656,6 +662,16 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                     params["logit_opacities"].data[write_indices, 0] = new_logit_vals
                     n_degenerated += changed.sum().item()
 
+                    # FEEDBACK-LOOP BREAK: clear visibility tracking for
+                    # degenerated Gaussians so they must re-mature before
+                    # being judged again (probation period = min_obs frames).
+                    if reset_on_degenerate:
+                        if "vis_history" in variables:
+                            # Works for both 1D (EMA) and 2D (uniform buffer) shapes
+                            variables["vis_history"][write_indices] = 0.0
+                        if "vis_frame_count" in variables:
+                            variables["vis_frame_count"][write_indices] = 0.0
+
     # --- Spatial floaters: mild fixed decay ---
     if (enable_spatial and curr_data is not None and transformed_pts is not None):
         gamma = innovation_config.get("distance_gamma", 0.5)
@@ -665,9 +681,21 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                 affected_logit = params["logit_opacities"].data[spatial_floater, 0]
                 affected_opacity = torch.sigmoid(affected_logit)
                 new_opacity = (affected_opacity * eta_spatial).clamp(opacity_floor, 1 - 1e-6)
-                new_logit_vals = torch.log(new_opacity / (1 - new_opacity))
-                params["logit_opacities"].data[spatial_floater, 0] = new_logit_vals
-                n_degenerated += spatial_floater.sum().item()
+                # Same float-drift guard as the TVS branch
+                changed_sp = (new_opacity - affected_opacity).abs() > 1e-6
+                if changed_sp.any():
+                    spatial_indices = torch.where(spatial_floater)[0]
+                    write_sp = spatial_indices[changed_sp]
+                    new_logit_vals = torch.log(new_opacity[changed_sp] / (1 - new_opacity[changed_sp]))
+                    params["logit_opacities"].data[write_sp, 0] = new_logit_vals
+                    n_degenerated += changed_sp.sum().item()
+
+                    # FEEDBACK-LOOP BREAK: re-probation, same as TVS branch
+                    if reset_on_degenerate:
+                        if "vis_history" in variables:
+                            variables["vis_history"][write_sp] = 0.0
+                        if "vis_frame_count" in variables:
+                            variables["vis_frame_count"][write_sp] = 0.0
 
     # Note: no hard removal here. The opacity_floor ensures degenerated
     # Gaussians stay above the standard removal threshold (0.005).

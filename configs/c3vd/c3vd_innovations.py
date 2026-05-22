@@ -146,6 +146,7 @@ config = dict(
         tvs_min_obs=50,                 # Maturation gate: min observed frames before TVS-eligible
         tvs_degenerate_every=1,         # Run degeneration every N frames (1=every frame; raise to dampen compounding)
         tvs_log_every=0,                # Print TVS distribution every N frames (0=disabled)
+        tvs_reset_on_degenerate=True,   # After degeneration: zero vis history + frame_count -> re-probation. Breaks the V<->sigma feedback loop.
         eta_spatial=0.9,                # Spatial floater mild decay factor (multiplicative)
         enable_spatial_mask=False,      # Toggle spatial floater detection (depth-based)
         distance_gamma=0.5,             # Depth-diff threshold (meters) for spatial floater mask
