@@ -819,6 +819,21 @@ def rgbd_slam(config: dict):
     tracking_frame_time_count = 0
     mapping_frame_time_sum = 0
     mapping_frame_time_count = 0
+    # --- ICRA: Peak VRAM (in MB) tracked per-phase across the run ---
+    # cuda.reset_peak_memory_stats() resets the high-water mark before each
+    # phase; cuda.max_memory_allocated() reads it after. Both are free (just
+    # counter reads/writes); no synchronize needed.
+    def _peak_vram_mb():
+        if torch.cuda.is_available():
+            return torch.cuda.max_memory_allocated() / (1024 ** 2)
+        return 0.0
+    def _reset_peak_vram():
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    tracking_peak_vram_mb = 0.0
+    mapping_peak_vram_mb = 0.0
+    refinement_peak_vram_mb = 0.0
+    refinement_total_time_s = 0.0
 
     # Checkpoint loading
     if config["load_checkpoint"]:
@@ -889,6 +904,7 @@ def rgbd_slam(config: dict):
         # ----------------------------------------------------
         # TRACKING
         # ----------------------------------------------------
+        _reset_peak_vram()
         tracking_start_time = time.time()
         if time_idx > 0 and not config["tracking"]["use_gt_poses"]:
             optimizer = initialize_optimizer(params, config["tracking"]["lrs"])
@@ -957,6 +973,7 @@ def rgbd_slam(config: dict):
 
         tracking_frame_time_sum += time.time() - tracking_start_time
         tracking_frame_time_count += 1
+        tracking_peak_vram_mb = max(tracking_peak_vram_mb, _peak_vram_mb())
 
         # Update visibility buffer ONCE per frame, using gauss_vis from the
         # last tracking render (which rendered the CURRENT frame).
@@ -1023,6 +1040,7 @@ def rgbd_slam(config: dict):
             optimizer = initialize_optimizer(params, config["mapping"]["lrs"])
 
             # Mapping iterations
+            _reset_peak_vram()
             mapping_start_time = time.time()
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Step: {time_idx}")
@@ -1134,6 +1152,7 @@ def rgbd_slam(config: dict):
 
             mapping_frame_time_sum += time.time() - mapping_start_time
             mapping_frame_time_count += 1
+            mapping_peak_vram_mb = max(mapping_peak_vram_mb, _peak_vram_mb())
 
             # TVS-Guided Soft Pruning: degenerate BETWEEN frames
             # (after mapping optimizer is done — no optimizer state corruption)
@@ -1271,6 +1290,8 @@ def rgbd_slam(config: dict):
     # --------------------------------------------------------
     innovation_cfg = config.get("innovations", {})
     if innovation_cfg.get("enable_refinement", False) and len(keyframe_list) > 0:
+        _reset_peak_vram()
+        _refinement_start_t = time.time()
         print("\n=== Post-SLAM Refinement ===")
         refine_stage1_iters = innovation_cfg.get("refine_stage1_iters", 100)
         refine_stage2_iters = innovation_cfg.get("refine_stage2_iters", 500)
@@ -1368,6 +1389,9 @@ def rgbd_slam(config: dict):
             refine_bar2.update(1)
         refine_bar2.close()
         print("  Refinement complete.")
+        refinement_total_time_s = time.time() - _refinement_start_t
+        refinement_peak_vram_mb = _peak_vram_mb()
+        print(f"  Refinement total: {refinement_total_time_s:.1f}s, peak VRAM: {refinement_peak_vram_mb:.1f} MB")
 
     # Final evaluation
     eval_ds = [dataset, eval_dataset, "C3VD"] if dataset_config["train_or_test"] == "train" else dataset
@@ -1389,6 +1413,51 @@ def rgbd_slam(config: dict):
 
     save_params(params, output_dir)
     save_means3D(params["means3D"], output_dir)
+
+    # --- ICRA: compute / memory summary ---
+    # Final Gaussian count + disk size + peak VRAM per phase + refinement time.
+    # Appended to runtimes.txt and also written as metrics.json for easy parsing.
+    import json
+    final_gauss_count = int(params["means3D"].shape[0])
+    params_npz_path = os.path.join(output_dir, "params.npz")
+    params_size_mb = (os.path.getsize(params_npz_path) / (1024 ** 2)
+                      if os.path.exists(params_npz_path) else 0.0)
+    means3D_ply_path = os.path.join(output_dir, "means3D.ply")
+    means3D_size_mb = (os.path.getsize(means3D_ply_path) / (1024 ** 2)
+                       if os.path.exists(means3D_ply_path) else 0.0)
+
+    print("\n--- Compute / Memory ---")
+    print(f"Peak VRAM (track / map / refine): {tracking_peak_vram_mb:.1f} / "
+          f"{mapping_peak_vram_mb:.1f} / {refinement_peak_vram_mb:.1f} MB")
+    print(f"Refinement total time: {refinement_total_time_s:.2f} s")
+    print(f"Final Gaussian count: {final_gauss_count:,}")
+    print(f"Disk: params.npz {params_size_mb:.2f} MB, means3D.ply {means3D_size_mb:.2f} MB")
+
+    with open(os.path.join(output_dir, "runtimes.txt"), "a") as f:
+        f.write("\n--- Compute / Memory ---\n")
+        f.write(f"Peak VRAM tracking:    {tracking_peak_vram_mb:.1f} MB\n")
+        f.write(f"Peak VRAM mapping:     {mapping_peak_vram_mb:.1f} MB\n")
+        f.write(f"Peak VRAM refinement:  {refinement_peak_vram_mb:.1f} MB\n")
+        f.write(f"Refinement total time: {refinement_total_time_s:.2f} s\n")
+        f.write(f"Final Gaussian count:  {final_gauss_count}\n")
+        f.write(f"params.npz disk size:  {params_size_mb:.2f} MB\n")
+        f.write(f"means3D.ply disk size: {means3D_size_mb:.2f} MB\n")
+
+    metrics = {
+        "tracking_iter_ms":       tracking_iter_time_avg * 1000.0,
+        "tracking_frame_s":       tracking_frame_time_avg,
+        "mapping_iter_ms":        mapping_iter_time_avg * 1000.0,
+        "mapping_frame_s":        mapping_frame_time_avg,
+        "tracking_peak_vram_mb":  tracking_peak_vram_mb,
+        "mapping_peak_vram_mb":   mapping_peak_vram_mb,
+        "refinement_peak_vram_mb": refinement_peak_vram_mb,
+        "refinement_total_s":     refinement_total_time_s,
+        "final_gauss_count":      final_gauss_count,
+        "params_npz_mb":          params_size_mb,
+        "means3D_ply_mb":         means3D_size_mb,
+    }
+    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
 
 
 # ============================================================
