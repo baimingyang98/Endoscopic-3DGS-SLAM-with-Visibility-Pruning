@@ -5,16 +5,25 @@ with K=0 as the control (current published behaviour). Compares #Gaussians and
 quality so we can see whether the hard removal of the dead population buys real
 compression without hurting PSNR/depth.
 
-Paste into a Colab cell after the repo is cloned and CWD is the repo root.
+Run the %%writefile config cell first, then paste this into a Colab cell.
 """
 import os, re, shutil, subprocess, sys, glob, time
 
-REPO = "/content/new_eGSLAM"          # repo root in Colab
-CFG = f"{REPO}/configs/c3vd/c3vd_innovations.py"
-SCENES = [4]                           # 4 = sigmoid_t2_a (densest clip)
-KS = [0, 50, 100, 200]                 # 0 = control (no dormancy timeout)
+REPO = "/content/project"                       # repo root in Colab
+CFG = f"{REPO}/configs/c3vd/c3vd_test.py"       # the config the writefile cell creates
+SCENES = [4]                                    # 4 = sigmoid_t2_a (densest clip)
+KS = [0, 50, 100, 200]                          # 0 = control (no dormancy timeout)
 
-# Canonical production TVS settings (the arm reported in the paper).
+# Scene list, must match `scenes` in the config.
+SCENE_NAMES = [
+    "cecum_t1_b", "cecum_t2_b", "cecum_t3_a",
+    "sigmoid_t1_a", "sigmoid_t2_a", "sigmoid_t3_a",
+    "trans_t1_b", "trans_t2_c", "trans_t4_a", "trans_t4_b",
+]
+
+# Canonical production TVS settings (the arm reported in the paper). Keys that
+# the config does not define are inserted; nothing here should differ from the
+# config except tvs_dormancy_frames, which is the variable under test.
 BASE = {
     "enable_tvs_pruning": "True",
     "enable_spatial_mask": "True",
@@ -35,17 +44,22 @@ BASE = {
 }
 
 os.chdir(REPO)
-backup = CFG + ".bak"
-if not os.path.exists(backup):
-    shutil.copy(CFG, backup)
+# Snapshot the pristine config. Refreshed every run, so re-running the
+# %%writefile cell always takes effect.
+ORIGINAL = open(CFG).read()
+assert "innovations=dict(" in ORIGINAL, f"{CFG} does not look like a run config"
 
 
 def patch(overrides, group_name):
-    src = open(backup).read()
+    src = ORIGINAL
     for key, val in overrides.items():
         src, n = re.subn(rf"^(\s*){key}\s*=\s*[^,]+,", rf"\g<1>{key}={val},",
                          src, count=1, flags=re.M)
-        assert n == 1, f"could not patch {key}"
+        if n == 0:                      # key absent: add it to the innovations block
+            src, n = re.subn(r"^(\s*)innovations=dict\(",
+                             rf"\g<1>innovations=dict(\n\g<1>    {key}={val},",
+                             src, count=1, flags=re.M)
+            assert n == 1, f"could not insert {key}"
     src, n = re.subn(r'^group_name\s*=\s*".*"', f'group_name = "{group_name}"',
                      src, count=1, flags=re.M)
     assert n == 1, "could not patch group_name"
@@ -57,18 +71,18 @@ try:
         group = f"C3VD_dorm_K{k}"
         patch(dict(BASE, tvs_dormancy_frames=str(k)), group)
         for scene in SCENES:
-            out = f"experiments/{group}/{scene}"
-            if glob.glob(f"experiments/{group}/*/params.npz"):
-                print(f"[skip] {group} scene {scene} already done")
+            name = SCENE_NAMES[scene]
+            if os.path.exists(f"experiments/{group}/{name}/params.npz"):
+                print(f"[skip] K={k} {name} already done")
                 continue
-            print(f"\n===== K={k}  scene_num={scene} =====", flush=True)
+            print(f"\n===== K={k}  scene={name} =====", flush=True)
             t0 = time.time()
             env = dict(os.environ, SCENE_NUM=str(scene))
             subprocess.run([sys.executable, "scripts/main.py", CFG],
                            env=env, check=True)
-            print(f"----- K={k} scene {scene} done in {(time.time()-t0)/60:.1f} min")
+            print(f"----- K={k} {name} done in {(time.time()-t0)/60:.1f} min")
 finally:
-    shutil.copy(backup, CFG)          # always restore the config
+    open(CFG, "w").write(ORIGINAL)      # always restore the config
 
 # Score every arm
 for k in KS:
