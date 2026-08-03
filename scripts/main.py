@@ -493,6 +493,9 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx,
         if "vis_frame_count" in variables:
             new_cnt = torch.zeros(n_new, device="cuda")
             variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
+        if "dormancy_count" in variables:
+            new_dorm = torch.zeros(n_new, device="cuda")
+            variables["dormancy_count"] = torch.cat([variables["dormancy_count"], new_dorm], dim=0)
         if "deform_mask" in variables:
             new_dm = torch.zeros(n_new, dtype=torch.bool, device="cuda")
             variables["deform_mask"] = torch.cat([variables["deform_mask"], new_dm], dim=0)
@@ -867,6 +870,7 @@ def rgbd_slam(config: dict):
     # ========================================================
     # MAIN LOOP
     # ========================================================
+    per_frame_gauss = []  # online Gaussian count after each frame (map-growth curve)
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
         # Load frame
         color, depth, _, gt_pose = dataset[time_idx]
@@ -1199,12 +1203,14 @@ def rgbd_slam(config: dict):
                         degen_pts = transform_to_frame(
                             params, time_idx, gaussians_grad=False, camera_grad=False
                         )
-                    params, n_degen = tvs_degenerate_between_frames(
+                    params, n_degen, n_dormant = tvs_degenerate_between_frames(
                         params, variables, innovation_cfg,
                         curr_data=curr_data, transformed_pts=degen_pts,
                     )
                     if tvs_log_every > 0 and (time_idx % tvs_log_every == 0):
-                        print(f"[TVS f{time_idx}] n_degenerated={n_degen}")
+                        print(f"[TVS f{time_idx}] n_degenerated={n_degen} "
+                              f"n_dormant_removed={n_dormant} "
+                              f"N={params['means3D'].shape[0]}")
 
             # Innovation 2: Periodic Bundle Adjustment
             innovation_cfg = config.get("innovations", {})
@@ -1254,6 +1260,9 @@ def rgbd_slam(config: dict):
             np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"),
                     np.array(keyframe_time_indices))
 
+        # Map-growth logging: live count after mapping/pruning/TVS for this frame
+        per_frame_gauss.append(int(params["means3D"].shape[0]))
+
         torch.cuda.empty_cache()
 
     # ========================================================
@@ -1284,6 +1293,13 @@ def rgbd_slam(config: dict):
         f.write(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000:.2f} ms\n")
         f.write(f"Average Mapping/Frame Time: {mapping_frame_time_avg:.4f} s\n")
         f.write(f"Total Frame Time: {tracking_frame_time_avg + mapping_frame_time_avg:.4f} s\n")
+
+    # Map-growth curve data: frame index and online Gaussian count
+    np.savetxt(os.path.join(output_dir, "per_frame_gauss.csv"),
+               np.c_[np.arange(len(per_frame_gauss)), per_frame_gauss],
+               fmt="%d", delimiter=",", header="frame,count", comments="")
+    print(f"Wrote {len(per_frame_gauss)} per-frame counts to "
+          f"{os.path.join(output_dir, 'per_frame_gauss.csv')}")
 
     # --------------------------------------------------------
     # POST-SLAM REFINEMENT (if enabled)

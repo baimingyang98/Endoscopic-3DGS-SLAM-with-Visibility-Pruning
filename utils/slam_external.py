@@ -254,24 +254,46 @@ def remove_points(to_remove, params, variables, optimizer):
             group["params"][0] = torch.nn.Parameter(group["params"][0][to_keep].requires_grad_(True))
             params[k] = group["params"][0]
 
-    # Standard variables
-    variables["means2D_gradient_accum"] = variables["means2D_gradient_accum"][to_keep]
-    variables["denom"] = variables["denom"][to_keep]
-    variables["max_2D_radius"] = variables["max_2D_radius"][to_keep]
-    if "timestep" in variables:
-        variables["timestep"] = variables["timestep"][to_keep]
+    _sync_variables_after_removal(to_keep, variables)
 
-    # Innovation 1+3: Keep innovation variables in sync
+    return params, variables
+
+
+def _sync_variables_after_removal(to_keep, variables):
+    """Slice every per-Gaussian entry of `variables` with the keep mask.
+
+    The accumulators are resized before slicing because this also runs between
+    frames, where they may still carry the count from the last mapping session.
+    """
     N = to_keep.shape[0]
+    for k in ("means2D_gradient_accum", "denom", "max_2D_radius", "timestep"):
+        if k in variables:
+            variables[k] = _resize_1d(variables[k], N)[to_keep]
     if "vis_history" in variables:
         variables["vis_history"] = _resize_vis_any(variables["vis_history"], N)[to_keep]
     if "vis_frame_count" in variables:
         variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)[to_keep]
+    if "dormancy_count" in variables:
+        variables["dormancy_count"] = _resize_1d(variables["dormancy_count"], N)[to_keep]
     if "deform_mask" in variables:
         variables["deform_mask"] = _resize_1d(variables["deform_mask"], N, dtype=torch.bool)[to_keep]
     if "prev_deform_offsets" in variables:
         variables["prev_deform_offsets"] = _resize_to_N(variables["prev_deform_offsets"], N)[to_keep]
 
+
+def remove_points_no_optimizer(to_remove, params, variables):
+    """
+    Remove Gaussians outside a mapping session, where no optimizer holds state.
+
+    Between frames the mapping optimizer has already been discarded and the next
+    frame builds a fresh one from `params`, so the parameter tensors can simply
+    be replaced by their sliced copies.
+    """
+    to_keep = ~to_remove
+    keys = [k for k in params.keys() if k not in ["cam_unnorm_rots", "cam_trans"]]
+    for k in keys:
+        params[k] = torch.nn.Parameter(params[k].data[to_keep].requires_grad_(True))
+    _sync_variables_after_removal(to_keep, variables)
     return params, variables
 
 
@@ -613,6 +635,7 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     Returns:
         params: with degenerated opacities
         n_degenerated: number of Gaussians that had opacity reduced
+        n_removed: number of Gaussians hard-removed by the dormancy timeout
     """
     tau_sig = innovation_config.get("tvs_tau_sig", 0.05)
     temperature = innovation_config.get("tvs_temperature", 0.02)
@@ -638,9 +661,18 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     #   low TVS -> sigma decayed -> rasterizer culls -> V=0 -> still low TVS -> ...
     # Without this, every mature Gaussian eventually collapses to floor.
     reset_on_degenerate = innovation_config.get("tvs_reset_on_degenerate", True)
+    # Dormancy timeout: a Gaussian that has been sitting at the opacity floor
+    # for this many consecutive frames is permanently removed. 0 disables it,
+    # which is the soft-only behaviour (every faded Gaussian is kept forever
+    # and still costs memory and render time). A positive value keeps the
+    # recoverability window - anything the optimizer lifts back off the floor
+    # resets its counter - while finally deleting the permanently dead
+    # population that the camera has left behind.
+    dormancy_frames = int(innovation_config.get("tvs_dormancy_frames", 0))
 
     N = params["means3D"].shape[0]
     n_degenerated = 0
+    n_removed = 0
 
     # --- TVS-guided soft degeneration (applied to ALL mature Gaussians) ---
     # The Gumbel-Sigmoid provides a smooth per-Gaussian decay:
@@ -708,12 +740,40 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                         if "vis_frame_count" in variables:
                             variables["vis_frame_count"][write_sp] = 0.0
 
-    # Note: no hard removal here. The opacity_floor ensures degenerated
-    # Gaussians stay above the standard removal threshold (0.005).
-    # They remain in the map with very low opacity, allowing recovery
-    # if they become visible from future viewpoints.
+    # --- Dormancy timeout: hard removal of the permanently dead population ---
+    # Without this the opacity_floor keeps every degenerated Gaussian above the
+    # standard removal threshold (0.005) forever, so they stay in the map at
+    # negligible opacity. The timeout deletes only those that have failed to
+    # recover for `dormancy_frames` consecutive frames.
+    if dormancy_frames > 0:
+        # This function runs once every `tvs_degenerate_every` frames, so the
+        # counter ticks in units of degeneration passes; convert the
+        # frame-valued threshold accordingly.
+        degen_every = max(1, int(innovation_config.get("tvs_degenerate_every", 1)))
+        hits_needed = max(1, int(round(dormancy_frames / degen_every)))
 
-    return params, n_degenerated
+        with torch.no_grad():
+            N_now = params["means3D"].shape[0]
+            opacity = torch.sigmoid(params["logit_opacities"].data[:, 0])
+            # "At the floor" with a small tolerance: the floor is applied by
+            # clamping, so a dormant Gaussian sits exactly at opacity_floor
+            # until the mapping optimizer lifts it back up.
+            at_floor = opacity <= opacity_floor * 1.05
+
+            count = variables.get("dormancy_count")
+            if count is None:
+                count = torch.zeros(N_now, device=opacity.device)
+            else:
+                count = _resize_1d(count, N_now)
+            count = torch.where(at_floor, count + 1.0, torch.zeros_like(count))
+            variables["dormancy_count"] = count
+
+            dormant = count >= hits_needed
+            if dormant.any():
+                n_removed = int(dormant.sum().item())
+                params, variables = remove_points_no_optimizer(dormant, params, variables)
+
+    return params, n_degenerated, n_removed
 
 
 # ============================================================
@@ -774,6 +834,11 @@ def _extend_innovation_vars_for_clone(variables, parent_mask):
     if "vis_frame_count" in variables:
         new_cnt = variables["vis_frame_count"][parent_mask]
         variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
+    if "dormancy_count" in variables:
+        # Clones/splits are created because they carry large gradients, so give
+        # them a fresh dormancy window rather than inheriting the parent's.
+        new_dorm = torch.zeros(int(parent_mask.sum()), device=variables["dormancy_count"].device)
+        variables["dormancy_count"] = torch.cat([variables["dormancy_count"], new_dorm], dim=0)
     if "deform_mask" in variables:
         new_mask = variables["deform_mask"][parent_mask]
         variables["deform_mask"] = torch.cat([variables["deform_mask"], new_mask], dim=0)
