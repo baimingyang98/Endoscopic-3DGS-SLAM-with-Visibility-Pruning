@@ -66,6 +66,29 @@ def patch(overrides, group_name):
     open(CFG, "w").write(src)
 
 
+# Full output goes to a log file; only lines matching this reach the cell.
+KEEP = re.compile(r"\[TVS f|Traceback|Error|error:|Wrote \d+ per-frame")
+
+
+def run_quiet(cmd, log_path, env=None):
+    """Run a subprocess, tee its output to log_path, echo only KEEP lines."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    tail = []
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+        for line in proc.stdout:
+            log.write(line)
+            tail = (tail + [line])[-40:]
+            if KEEP.search(line):
+                print("   " + line.rstrip(), flush=True)
+        rc = proc.wait()
+    if rc != 0:                          # only on failure do we dump context
+        print("".join(tail))
+        raise RuntimeError(f"{cmd[1]} failed (rc={rc}); full log: {log_path}")
+
+
 try:
     for k in KS:
         group = f"C3VD_dorm_K{k}"
@@ -77,17 +100,19 @@ try:
                 continue
             print(f"\n===== K={k}  scene={name} =====", flush=True)
             t0 = time.time()
-            env = dict(os.environ, SCENE_NUM=str(scene))
-            subprocess.run([sys.executable, "scripts/main.py", CFG],
-                           env=env, check=True)
+            run_quiet([sys.executable, "scripts/main.py", CFG],
+                      f"logs/{group}_{name}.log",
+                      env=dict(os.environ, SCENE_NUM=str(scene),
+                               TQDM_DISABLE="1"))   # silence the per-frame bars
             print(f"----- K={k} {name} done in {(time.time()-t0)/60:.1f} min")
 finally:
     open(CFG, "w").write(ORIGINAL)      # always restore the config
 
 # Score every arm
 for k in KS:
-    subprocess.run([sys.executable, "scripts/calc_metrics.py", "--all",
-                    "--group_dir", f"experiments/C3VD_dorm_K{k}"], check=False)
+    run_quiet([sys.executable, "scripts/calc_metrics.py", "--all",
+               "--group_dir", f"experiments/C3VD_dorm_K{k}"],
+              f"logs/metrics_K{k}.log")
 
 print("\n=== summary ===")
 for k in KS:
