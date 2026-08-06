@@ -273,8 +273,11 @@ def _sync_variables_after_removal(to_keep, variables):
         variables["vis_history"] = _resize_vis_any(variables["vis_history"], N)[to_keep]
     if "vis_frame_count" in variables:
         variables["vis_frame_count"] = _resize_1d(variables["vis_frame_count"], N)[to_keep]
-    if "dormancy_count" in variables:
-        variables["dormancy_count"] = _resize_1d(variables["dormancy_count"], N)[to_keep]
+    if "unseen_count" in variables:
+        variables["unseen_count"] = _resize_1d(variables["unseen_count"], N)[to_keep]
+    if "tvs_degenerated" in variables:
+        variables["tvs_degenerated"] = _resize_1d(
+            variables["tvs_degenerated"], N, dtype=torch.bool)[to_keep]
     if "deform_mask" in variables:
         variables["deform_mask"] = _resize_1d(variables["deform_mask"], N, dtype=torch.bool)[to_keep]
     if "prev_deform_offsets" in variables:
@@ -507,6 +510,14 @@ def update_vis_buffer(variables, gauss_vis, innovation_config):
     # Shared by both modes; drives the maturation gate.
     variables["vis_frame_count"][:N] += (gv > 0).float()
 
+    # Consecutive frames with no rendered contribution at all. This is the
+    # dormancy signal: it keeps counting for Gaussians the camera has left
+    # behind, whereas vis_frame_count stops (and is reset by re-probation),
+    # which is why opacity alone cannot identify the dead population.
+    unseen = variables.get("unseen_count")
+    unseen = torch.zeros(N, device=gv.device) if unseen is None else _resize_1d(unseen, N)
+    variables["unseen_count"] = torch.where(gv > 0, torch.zeros_like(unseen), unseen + 1.0)
+
     return variables
 
 
@@ -661,18 +672,34 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     #   low TVS -> sigma decayed -> rasterizer culls -> V=0 -> still low TVS -> ...
     # Without this, every mature Gaussian eventually collapses to floor.
     reset_on_degenerate = innovation_config.get("tvs_reset_on_degenerate", True)
-    # Dormancy timeout: a Gaussian that has been sitting at the opacity floor
-    # for this many consecutive frames is permanently removed. 0 disables it,
-    # which is the soft-only behaviour (every faded Gaussian is kept forever
-    # and still costs memory and render time). A positive value keeps the
-    # recoverability window - anything the optimizer lifts back off the floor
-    # resets its counter - while finally deleting the permanently dead
-    # population that the camera has left behind.
+    # Dormancy timeout: permanently remove a Gaussian once it has been judged
+    # insignificant (degenerated at least once) AND has gone this many
+    # consecutive frames without being rendered at all. 0 disables it, which is
+    # the soft-only behaviour where every faded Gaussian is kept forever and
+    # still costs memory and render time.
+    #
+    # The unseen counter, not opacity, is the criterion. Re-probation
+    # (tvs_reset_on_degenerate) zeroes vis_frame_count after a degeneration, so
+    # a Gaussian the camera has left behind can never re-mature and is never
+    # decayed a second time: it strands well above the opacity floor. Requiring
+    # a prior degeneration keeps the timeout from touching Gaussians the method
+    # never flagged, and any Gaussian rendered again before the timeout expires
+    # resets its counter, preserving the recovery window.
     dormancy_frames = int(innovation_config.get("tvs_dormancy_frames", 0))
 
     N = params["means3D"].shape[0]
     n_degenerated = 0
     n_removed = 0
+
+    def mark_degenerated(indices):
+        """Record that these Gaussians have been judged insignificant once."""
+        if dormancy_frames <= 0:
+            return
+        flag = variables.get("tvs_degenerated")
+        flag = (torch.zeros(N, dtype=torch.bool, device=indices.device)
+                if flag is None else _resize_1d(flag, N, dtype=torch.bool))
+        flag[indices] = True
+        variables["tvs_degenerated"] = flag
 
     # --- TVS-guided soft degeneration (applied to ALL mature Gaussians) ---
     # The Gumbel-Sigmoid provides a smooth per-Gaussian decay:
@@ -704,6 +731,7 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                     new_logit_vals = torch.log(changed_opacity / (1 - changed_opacity))
                     params["logit_opacities"].data[write_indices, 0] = new_logit_vals
                     n_degenerated += changed.sum().item()
+                    mark_degenerated(write_indices)
 
                     # FEEDBACK-LOOP BREAK: clear visibility tracking for
                     # degenerated Gaussians so they must re-mature before
@@ -732,6 +760,7 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                     new_logit_vals = torch.log(new_opacity[changed_sp] / (1 - new_opacity[changed_sp]))
                     params["logit_opacities"].data[write_sp, 0] = new_logit_vals
                     n_degenerated += changed_sp.sum().item()
+                    mark_degenerated(write_sp)
 
                     # FEEDBACK-LOOP BREAK: re-probation, same as TVS branch
                     if reset_on_degenerate:
@@ -745,30 +774,15 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     # standard removal threshold (0.005) forever, so they stay in the map at
     # negligible opacity. The timeout deletes only those that have failed to
     # recover for `dormancy_frames` consecutive frames.
-    if dormancy_frames > 0:
-        # This function runs once every `tvs_degenerate_every` frames, so the
-        # counter ticks in units of degeneration passes; convert the
-        # frame-valued threshold accordingly.
-        degen_every = max(1, int(innovation_config.get("tvs_degenerate_every", 1)))
-        hits_needed = max(1, int(round(dormancy_frames / degen_every)))
-
+    if dormancy_frames > 0 and "unseen_count" in variables:
         with torch.no_grad():
             N_now = params["means3D"].shape[0]
-            opacity = torch.sigmoid(params["logit_opacities"].data[:, 0])
-            # "At the floor" with a small tolerance: the floor is applied by
-            # clamping, so a dormant Gaussian sits exactly at opacity_floor
-            # until the mapping optimizer lifts it back up.
-            at_floor = opacity <= opacity_floor * 1.05
+            unseen = _resize_1d(variables["unseen_count"], N_now)
+            flagged = variables.get("tvs_degenerated")
+            flagged = (torch.zeros(N_now, dtype=torch.bool, device=unseen.device)
+                       if flagged is None else _resize_1d(flagged, N_now, dtype=torch.bool))
 
-            count = variables.get("dormancy_count")
-            if count is None:
-                count = torch.zeros(N_now, device=opacity.device)
-            else:
-                count = _resize_1d(count, N_now)
-            count = torch.where(at_floor, count + 1.0, torch.zeros_like(count))
-            variables["dormancy_count"] = count
-
-            dormant = count >= hits_needed
+            dormant = (unseen >= dormancy_frames) & flagged
             if dormant.any():
                 n_removed = int(dormant.sum().item())
                 params, variables = remove_points_no_optimizer(dormant, params, variables)
@@ -834,11 +848,18 @@ def _extend_innovation_vars_for_clone(variables, parent_mask):
     if "vis_frame_count" in variables:
         new_cnt = variables["vis_frame_count"][parent_mask]
         variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
-    if "dormancy_count" in variables:
-        # Clones/splits are created because they carry large gradients, so give
-        # them a fresh dormancy window rather than inheriting the parent's.
-        new_dorm = torch.zeros(int(parent_mask.sum()), device=variables["dormancy_count"].device)
-        variables["dormancy_count"] = torch.cat([variables["dormancy_count"], new_dorm], dim=0)
+    # Clones/splits are created because they carry large gradients, so they
+    # start unseen-free and unflagged rather than inheriting the parent's state.
+    n_new = int(parent_mask.sum())
+    if "unseen_count" in variables:
+        variables["unseen_count"] = torch.cat(
+            [variables["unseen_count"],
+             torch.zeros(n_new, device=variables["unseen_count"].device)], dim=0)
+    if "tvs_degenerated" in variables:
+        variables["tvs_degenerated"] = torch.cat(
+            [variables["tvs_degenerated"],
+             torch.zeros(n_new, dtype=torch.bool,
+                         device=variables["tvs_degenerated"].device)], dim=0)
     if "deform_mask" in variables:
         new_mask = variables["deform_mask"][parent_mask]
         variables["deform_mask"] = torch.cat([variables["deform_mask"], new_mask], dim=0)

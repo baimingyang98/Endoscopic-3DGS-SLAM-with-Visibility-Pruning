@@ -13,6 +13,7 @@ REPO = "/content/project"                       # repo root in Colab
 CFG = f"{REPO}/configs/c3vd/c3vd_test.py"       # the config the writefile cell creates
 SCENES = [4]                                    # 4 = sigmoid_t2_a (densest clip)
 KS = [0, 50, 100, 200]                          # 0 = control (no dormancy timeout)
+GROUP = "C3VD_dormv2_K"                         # v2 = unseen-based criterion
 
 # Scene list, must match `scenes` in the config.
 SCENE_NAMES = [
@@ -91,7 +92,7 @@ def run_quiet(cmd, log_path, env=None):
 
 try:
     for k in KS:
-        group = f"C3VD_dorm_K{k}"
+        group = f"{GROUP}{k}"
         patch(dict(BASE, tvs_dormancy_frames=str(k)), group)
         for scene in SCENES:
             name = SCENE_NAMES[scene]
@@ -111,12 +112,12 @@ finally:
 # Score every arm
 for k in KS:
     run_quiet([sys.executable, "scripts/calc_metrics.py", "--all",
-               "--group_dir", f"experiments/C3VD_dorm_K{k}"],
-              f"logs/metrics_K{k}.log")
+               "--group_dir", f"experiments/{GROUP}{k}"],
+              f"logs/metrics_{GROUP}{k}.log")
 
 print("\n=== summary ===")
 for k in KS:
-    for f in sorted(glob.glob(f"experiments/C3VD_dorm_K{k}/**/metrics_summary.csv",
+    for f in sorted(glob.glob(f"experiments/{GROUP}{k}/**/metrics_summary.csv",
                               recursive=True)):
         print(f"K={k}: {f}")
         print(open(f).read())

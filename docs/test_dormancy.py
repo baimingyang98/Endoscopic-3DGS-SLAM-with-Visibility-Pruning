@@ -1,8 +1,10 @@
 """CPU smoke test for the TVS dormancy timeout (tvs_dormancy_frames).
 
-Checks that (1) Gaussians pinned at the opacity floor are removed after the
-configured number of frames, (2) a Gaussian the optimizer lifts off the floor
-resets its counter and survives, and (3) params/variables stay in sync.
+Checks that (1) Gaussians that were degenerated once and have since gone
+unrendered for K frames are removed, (2) a Gaussian rendered again before the
+timeout expires resets its counter and survives, (3) a Gaussian the method
+never flagged is never removed no matter how long it goes unseen, and
+(4) params/variables stay in sync.
 
 Run: python docs/test_dormancy.py
 """
@@ -10,15 +12,36 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from utils.slam_external import tvs_degenerate_between_frames
+from utils.slam_external import tvs_degenerate_between_frames, update_vis_buffer
 
 N = 6
 FLOOR = 0.01
+K = 3
+
+# Gaussian roles:
+#   0: healthy, rendered every frame            -> survives
+#   1: dead, but never flagged by TVS           -> survives (never degenerated)
+#   2: dead, flagged                            -> removed at the timeout
+#   3: dead, flagged                            -> removed at the timeout
+#   4: flagged, re-rendered every other frame   -> counter keeps resetting
+#   5: dead, flagged                            -> removed at the timeout
+VISIBLE_ALWAYS = [0]
+REAPPEARS_AT = {4: (2, 4)}      # never dark for K consecutive frames
+
+cfg = dict(
+    enable_tvs_pruning=True,
+    tvs_aggregation="ema",
+    tvs_ema_lambda=0.18,
+    tvs_opacity_floor=FLOOR,
+    tvs_min_obs=50,
+    tvs_degenerate_every=1,
+    tvs_dormancy_frames=K,
+    enable_spatial_mask=False,
+)
 
 
 def make_state():
-    opac = torch.full((N, 1), FLOOR)      # all start pinned at the floor
-    opac[0] = 0.9                          # one healthy Gaussian
+    opac = torch.full((N, 1), 0.5)
     logit = torch.log(opac / (1 - opac))
     params = {
         "means3D": torch.nn.Parameter(torch.randn(N, 3)),
@@ -34,52 +57,54 @@ def make_state():
         "denom": torch.zeros(N),
         "max_2D_radius": torch.zeros(N),
         "timestep": torch.zeros(N),
-        "vis_history": torch.zeros(N),          # EMA mode
-        "vis_frame_count": torch.zeros(N),      # nothing mature -> no TVS decay
+        "vis_history": torch.zeros(N),
+        "vis_frame_count": torch.zeros(N),
+        # everything except index 1 has already been judged insignificant
+        "tvs_degenerated": torch.tensor([True, False, True, True, True, True]),
         "scene_radius": torch.tensor(1.0),
     }
     return params, variables
 
 
-cfg = dict(
-    enable_tvs_pruning=True,
-    tvs_aggregation="ema",
-    tvs_opacity_floor=FLOOR,
-    tvs_min_obs=50,
-    tvs_degenerate_every=1,
-    tvs_dormancy_frames=3,
-    enable_spatial_mask=False,
-)
-
 params, variables = make_state()
-for frame in range(1, 5):
-    if frame == 3:
-        # the mapping optimizer revives Gaussian index 1 (recoverability)
-        with torch.no_grad():
-            params["logit_opacities"].data[1, 0] = torch.log(
-                torch.tensor(0.4 / 0.6))
-    params, n_degen, n_removed = tvs_degenerate_between_frames(
-        params, variables, cfg)
-    n_now = params["means3D"].shape[0]
-    print(f"frame {frame}: removed={n_removed} N={n_now} "
-          f"dormancy={variables['dormancy_count'].tolist()}")
+# timestep doubles as an identity tag: it is sliced on every removal, so the
+# survivors' original indices can be read back out at the end.
+variables["timestep"] = torch.arange(N, dtype=torch.float)
 
+for frame in range(1, 6):
+    alive = [int(t) for t in variables["timestep"]]
+    vis = torch.tensor([0.7 if (gid in VISIBLE_ALWAYS
+                                or frame in REAPPEARS_AT.get(gid, ()))
+                        else 0.0 for gid in alive])
+    update_vis_buffer(variables, vis, cfg)
+    params, n_degen, n_removed = tvs_degenerate_between_frames(params, variables, cfg)
+    print(f"frame {frame}: removed={n_removed} N={params['means3D'].shape[0]} "
+          f"alive={[int(t) for t in variables['timestep']]}")
+
+survivors = sorted(int(t) for t in variables["timestep"])
+assert survivors == [0, 1, 4], f"expected [0, 1, 4] to survive, got {survivors}"
 n_now = params["means3D"].shape[0]
-assert n_now == 2, f"expected 2 survivors (healthy + revived), got {n_now}"
-opac = torch.sigmoid(params["logit_opacities"][:, 0])
-assert (opac > FLOOR * 1.05).all(), f"survivors should be off the floor: {opac}"
+assert n_now == 3, f"expected 3 survivors, got {n_now}"
 for k in ("means2D_gradient_accum", "denom", "max_2D_radius", "timestep",
-          "vis_history", "vis_frame_count", "dormancy_count"):
+          "vis_history", "vis_frame_count", "unseen_count", "tvs_degenerated"):
     assert variables[k].shape[0] == n_now, f"{k} out of sync: {variables[k].shape}"
 
-# disabled by default: tvs_dormancy_frames=0 must remove nothing
+# An unflagged Gaussian must survive unbounded dormancy.
+params, variables = make_state()
+variables["tvs_degenerated"] = torch.zeros(N, dtype=torch.bool)
+for _ in range(20):
+    update_vis_buffer(variables, torch.zeros(N), cfg)
+    params, _, n_removed = tvs_degenerate_between_frames(params, variables, cfg)
+    assert n_removed == 0, "unflagged Gaussians must never be removed"
+
+# Disabled by default: tvs_dormancy_frames=0 must remove nothing.
 params, variables = make_state()
 cfg_off = dict(cfg, tvs_dormancy_frames=0)
-for _ in range(5):
+for _ in range(20):
+    update_vis_buffer(variables, torch.zeros(N), cfg_off)
     params, _, n_removed = tvs_degenerate_between_frames(params, variables, cfg_off)
     assert n_removed == 0
 assert params["means3D"].shape[0] == N
-assert "dormancy_count" not in variables
 
-print("OK: dormancy timeout removes dead Gaussians, spares revived ones, "
-      "and is inert when disabled")
+print("OK: dormancy timeout removes flagged+unseen Gaussians, spares revived "
+      "and unflagged ones, and is inert when disabled")

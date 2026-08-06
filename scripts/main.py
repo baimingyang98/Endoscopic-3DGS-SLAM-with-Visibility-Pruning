@@ -493,9 +493,12 @@ def add_new_gaussians(params, variables, curr_data, sil_thres, time_idx,
         if "vis_frame_count" in variables:
             new_cnt = torch.zeros(n_new, device="cuda")
             variables["vis_frame_count"] = torch.cat([variables["vis_frame_count"], new_cnt], dim=0)
-        if "dormancy_count" in variables:
-            new_dorm = torch.zeros(n_new, device="cuda")
-            variables["dormancy_count"] = torch.cat([variables["dormancy_count"], new_dorm], dim=0)
+        if "unseen_count" in variables:
+            new_unseen = torch.zeros(n_new, device="cuda")
+            variables["unseen_count"] = torch.cat([variables["unseen_count"], new_unseen], dim=0)
+        if "tvs_degenerated" in variables:
+            new_flag = torch.zeros(n_new, dtype=torch.bool, device="cuda")
+            variables["tvs_degenerated"] = torch.cat([variables["tvs_degenerated"], new_flag], dim=0)
         if "deform_mask" in variables:
             new_dm = torch.zeros(n_new, dtype=torch.bool, device="cuda")
             variables["deform_mask"] = torch.cat([variables["deform_mask"], new_dm], dim=0)
