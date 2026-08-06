@@ -686,6 +686,11 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     # never flagged, and any Gaussian rendered again before the timeout expires
     # resets its counter, preserving the recovery window.
     dormancy_frames = int(innovation_config.get("tvs_dormancy_frames", 0))
+    # Dry-run probe: candidate K values to *count* without removing anything.
+    # One control run then yields the whole compression-vs-K curve, since
+    # removal is monotone in unseen_count. Results land in
+    # variables["dormancy_probe"] for the caller to log.
+    probe = tuple(innovation_config.get("tvs_dormancy_probe", ()) or ())
 
     N = params["means3D"].shape[0]
     n_degenerated = 0
@@ -693,7 +698,7 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
 
     def mark_degenerated(indices):
         """Record that these Gaussians have been judged insignificant once."""
-        if dormancy_frames <= 0:
+        if dormancy_frames <= 0 and not probe:
             return
         flag = variables.get("tvs_degenerated")
         flag = (torch.zeros(N, dtype=torch.bool, device=indices.device)
@@ -774,7 +779,7 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     # standard removal threshold (0.005) forever, so they stay in the map at
     # negligible opacity. The timeout deletes only those that have failed to
     # recover for `dormancy_frames` consecutive frames.
-    if dormancy_frames > 0 and "unseen_count" in variables:
+    if (dormancy_frames > 0 or probe) and "unseen_count" in variables:
         with torch.no_grad():
             N_now = params["means3D"].shape[0]
             unseen = _resize_1d(variables["unseen_count"], N_now)
@@ -782,10 +787,23 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
             flagged = (torch.zeros(N_now, dtype=torch.bool, device=unseen.device)
                        if flagged is None else _resize_1d(flagged, N_now, dtype=torch.bool))
 
-            dormant = (unseen >= dormancy_frames) & flagged
-            if dormant.any():
-                n_removed = int(dormant.sum().item())
-                params, variables = remove_points_no_optimizer(dormant, params, variables)
+            if probe:
+                # Count only; the map is left untouched. This is an upper bound
+                # on what a real run would remove, because removing Gaussians
+                # also changes the densification that follows.
+                variables["dormancy_probe"] = {
+                    int(kk): int(((unseen >= kk) & flagged).sum().item())
+                    for kk in probe
+                }
+                variables["dormancy_probe"]["N"] = N_now
+                variables["dormancy_probe"]["flagged"] = int(flagged.sum().item())
+
+            if dormancy_frames > 0:
+                dormant = (unseen >= dormancy_frames) & flagged
+                if dormant.any():
+                    n_removed = int(dormant.sum().item())
+                    params, variables = remove_points_no_optimizer(
+                        dormant, params, variables)
 
     return params, n_degenerated, n_removed
 

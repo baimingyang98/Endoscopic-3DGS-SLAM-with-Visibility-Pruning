@@ -1214,6 +1214,14 @@ def rgbd_slam(config: dict):
                         print(f"[TVS f{time_idx}] n_degenerated={n_degen} "
                               f"n_dormant_removed={n_dormant} "
                               f"N={params['means3D'].shape[0]}")
+                        probe = variables.get("dormancy_probe")
+                        if probe:
+                            n_tot = probe["N"]
+                            curve = " ".join(
+                                f"K={kk}:{probe[kk]} ({100.0 * probe[kk] / max(n_tot, 1):.1f}%)"
+                                for kk in sorted(k for k in probe if isinstance(k, int)))
+                            print(f"[DORM f{time_idx}] N={n_tot} "
+                                  f"flagged={probe['flagged']} would-remove {curve}")
 
             # Innovation 2: Periodic Bundle Adjustment
             innovation_cfg = config.get("innovations", {})
