@@ -148,7 +148,9 @@ config = dict(
         tvs_degenerate_every=1,         # Run degeneration every N frames (1=every frame; raise to dampen compounding)
         tvs_log_every=0,                # Print TVS distribution every N frames (0=disabled)
         tvs_reset_on_degenerate=True,   # After degeneration: zero vis history + frame_count -> re-probation. Breaks the V<->sigma feedback loop.
-        tvs_dormancy_frames=0,          # Hard-remove a Gaussian after this many consecutive frames stuck at the opacity floor. 0=off (soft-only: faded Gaussians are kept forever). E.g. 100 keeps the recovery window but deletes the permanently dead population.
+        tvs_dormancy_frames=0,          # Hard-remove a Gaussian after this many consecutive frames unrendered, if it has been TVS-degenerated at least once. 0=off (soft-only: faded Gaussians are kept forever).
+        tvs_dormancy_probe=(),          # Dry-run: candidate K values to COUNT without removing, e.g. (10,25,50,100,200). Logs the compression-vs-K curve from a single control run.
+        tvs_reset_on_spatial=True,      # Whether spatial decays also re-probate (zero vis history + frame_count). True=original coupled behaviour. False decouples: spatial floaters keep their observation count, so far more Gaussians reach the maturation gate and the temporal term actually applies.
         eta_spatial=0.9,                # Spatial floater mild decay factor (multiplicative)
         enable_spatial_mask=False,      # Toggle spatial floater detection (depth-based)
         distance_gamma=0.5,             # Depth-diff threshold (meters) for spatial floater mask

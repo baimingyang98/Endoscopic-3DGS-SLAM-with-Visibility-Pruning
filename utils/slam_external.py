@@ -672,6 +672,15 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
     #   low TVS -> sigma decayed -> rasterizer culls -> V=0 -> still low TVS -> ...
     # Without this, every mature Gaussian eventually collapses to floor.
     reset_on_degenerate = innovation_config.get("tvs_reset_on_degenerate", True)
+    # Whether the spatial branch also re-probates. Re-probation exists to break
+    # the V<->sigma loop for the TEMPORAL test, where a decayed Gaussian gets
+    # culled by the rasterizer, reports V=0, and would be decayed again forever.
+    # Spatial floaters are by definition in view, so that loop does not apply to
+    # them, and resetting their observation count has a side effect: with
+    # ~1e5 spatial decays per pass, most of the map is permanently held below
+    # the maturation gate and can never be judged by the temporal term at all.
+    # True reproduces the original coupled behaviour.
+    reset_on_spatial = innovation_config.get("tvs_reset_on_spatial", True)
     # Dormancy timeout: permanently remove a Gaussian once it has been judged
     # insignificant (degenerated at least once) AND has gone this many
     # consecutive frames without being rendered at all. 0 disables it, which is
@@ -767,8 +776,8 @@ def tvs_degenerate_between_frames(params, variables, innovation_config, curr_dat
                     n_degenerated += changed_sp.sum().item()
                     mark_degenerated(write_sp)
 
-                    # FEEDBACK-LOOP BREAK: re-probation, same as TVS branch
-                    if reset_on_degenerate:
+                    # Re-probation, same as TVS branch, unless decoupled
+                    if reset_on_degenerate and reset_on_spatial:
                         if "vis_history" in variables:
                             variables["vis_history"][write_sp] = 0.0
                         if "vis_frame_count" in variables:

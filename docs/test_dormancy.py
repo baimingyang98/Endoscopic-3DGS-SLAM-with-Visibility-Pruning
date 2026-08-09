@@ -108,3 +108,38 @@ assert params["means3D"].shape[0] == N
 
 print("OK: dormancy timeout removes flagged+unseen Gaussians, spares revived "
       "and unflagged ones, and is inert when disabled")
+
+
+# ----------------------------------------------------------------------
+# tvs_reset_on_spatial: does the spatial branch starve the maturation gate?
+# ----------------------------------------------------------------------
+def spatial_state():
+    """Gaussians 1 metre in front of a surface observed at 2 m -> all floaters."""
+    params, variables = make_state()
+    variables["vis_frame_count"] = torch.full((N,), 40.0)   # approaching min_obs=50
+    pts = torch.zeros(N, 3)
+    pts[:, 2] = 1.0                                          # 1 m from camera
+    curr = {
+        "depth": torch.full((1, 8, 8), 2.0),                 # surface at 2 m
+        "intrinsics": torch.tensor([[4.0, 0.0, 4.0],
+                                    [0.0, 4.0, 4.0],
+                                    [0.0, 0.0, 1.0]]),
+    }
+    return params, variables, pts, curr
+
+
+for coupled in (True, False):
+    params, variables, pts, curr = spatial_state()
+    cfg_sp = dict(cfg, enable_spatial_mask=True, tvs_dormancy_frames=0,
+                  tvs_reset_on_spatial=coupled)
+    params, n_degen, _ = tvs_degenerate_between_frames(
+        params, variables, cfg_sp, curr_data=curr, transformed_pts=pts)
+    counts = variables["vis_frame_count"]
+    assert n_degen == N, f"all {N} should be spatial floaters, got {n_degen}"
+    if coupled:
+        assert (counts == 0).all(), f"coupled: counts should be reset, got {counts}"
+    else:
+        assert (counts == 40).all(), f"decoupled: counts should survive, got {counts}"
+
+print("OK: tvs_reset_on_spatial=True re-probates spatial floaters (original "
+      "behaviour); False leaves their observation counts intact")
