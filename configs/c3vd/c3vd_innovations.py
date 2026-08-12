@@ -150,6 +150,8 @@ config = dict(
         tvs_reset_on_degenerate=True,   # After degeneration: zero vis history + frame_count -> re-probation. Breaks the V<->sigma feedback loop.
         tvs_dormancy_frames=0,          # Hard-remove a Gaussian after this many consecutive frames unrendered, if it has been TVS-degenerated at least once. 0=off (soft-only: faded Gaussians are kept forever).
         tvs_dormancy_probe=(),          # Dry-run: candidate K values to COUNT without removing, e.g. (10,25,50,100,200). Logs the compression-vs-K curve from a single control run.
+        tvs_final_cleanup=True,         # After refinement, hard-remove Gaussians still sitting at the opacity floor. They are invisible and unrecoverable once the stream ends, but still cost storage and per-Gaussian rasterizer work. On C3VD this is ~36% of the map at no measurable quality cost (mean PSNR change -0.0001 dB). Only applies when enable_tvs_pruning is on.
+        tvs_cleanup_threshold=0.011,    # Opacity at or below which the final cleanup removes a Gaussian. Defaults to 1.1x tvs_opacity_floor if unset: high enough to catch the floor, low enough to leave live Gaussians alone.
         tvs_reset_on_spatial=True,      # Whether spatial decays also re-probate (zero vis history + frame_count). True=original coupled behaviour. False decouples: spatial floaters keep their observation count, so far more Gaussians reach the maturation gate and the temporal term actually applies.
         eta_spatial=0.9,                # Spatial floater mild decay factor (multiplicative)
         enable_spatial_mask=False,      # Toggle spatial floater detection (depth-based)

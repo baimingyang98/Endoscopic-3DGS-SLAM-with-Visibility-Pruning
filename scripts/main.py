@@ -38,7 +38,7 @@ from utils.slam_helpers import (
 from utils.slam_external import (
     calc_ssim, build_rotation, prune_gaussians, densify,
     update_three_way_classifier, update_vis_buffer,
-    tvs_degenerate_between_frames,
+    tvs_degenerate_between_frames, remove_points_no_optimizer,
 )
 from utils.vis_utils import plot_video
 
@@ -1420,6 +1420,36 @@ def rgbd_slam(config: dict):
         refinement_peak_vram_mb = _peak_vram_mb()
         print(f"  Refinement total: {refinement_total_time_s:.1f}s, peak VRAM: {refinement_peak_vram_mb:.1f} MB")
 
+    # --- TVS final cleanup ---
+    # Soft pruning decays opacity toward tvs_opacity_floor rather than deleting,
+    # and that floor deliberately sits above the removal threshold so a faded
+    # Gaussian stays recoverable while the stream is still running. Once the
+    # sequence ends nothing can revive it, yet it still occupies storage and
+    # still costs a slot in the rasterizer's per-Gaussian preprocess pass every
+    # frame. Remove them here, after refinement, since refinement is the last
+    # thing that could legitimately bring one back.
+    #
+    # Gated on TVS: this clears what TVS itself faded. A map built without TVS
+    # has almost nothing down there to clear (1.0% vs 36.4% on C3VD), which is
+    # why the same operation cannot compact a baseline map.
+    cleanup_removed = 0
+    if (innovation_cfg.get("enable_tvs_pruning", False)
+            and innovation_cfg.get("tvs_final_cleanup", True)):
+        cleanup_thres = innovation_cfg.get(
+            "tvs_cleanup_threshold",
+            innovation_cfg.get("tvs_opacity_floor", 0.01) * 1.1)
+        with torch.no_grad():
+            opacity = torch.sigmoid(params["logit_opacities"]).reshape(-1)
+            to_remove = opacity <= cleanup_thres
+            n_before = int(params["means3D"].shape[0])
+            cleanup_removed = int(to_remove.sum().item())
+            if cleanup_removed > 0:
+                params, variables = remove_points_no_optimizer(
+                    to_remove, params, variables)
+        print(f"[TVS cleanup] removed {cleanup_removed} Gaussians at "
+              f"alpha<={cleanup_thres:g} ({100.0 * cleanup_removed / n_before:.1f}%), "
+              f"{n_before} -> {params['means3D'].shape[0]}")
+
     # Final evaluation
     eval_ds = [dataset, eval_dataset, "C3VD"] if dataset_config["train_or_test"] == "train" else dataset
     with torch.no_grad():
@@ -1467,6 +1497,7 @@ def rgbd_slam(config: dict):
         f.write(f"Peak VRAM refinement:  {refinement_peak_vram_mb:.1f} MB\n")
         f.write(f"Refinement total time: {refinement_total_time_s:.2f} s\n")
         f.write(f"Final Gaussian count:  {final_gauss_count}\n")
+        f.write(f"Cleanup removed:       {cleanup_removed}\n")
         f.write(f"params.npz disk size:  {params_size_mb:.2f} MB\n")
         f.write(f"means3D.ply disk size: {means3D_size_mb:.2f} MB\n")
 
@@ -1480,6 +1511,7 @@ def rgbd_slam(config: dict):
         "refinement_peak_vram_mb": refinement_peak_vram_mb,
         "refinement_total_s":     refinement_total_time_s,
         "final_gauss_count":      final_gauss_count,
+        "cleanup_removed":        cleanup_removed,
         "params_npz_mb":          params_size_mb,
         "means3D_ply_mb":         means3D_size_mb,
     }
