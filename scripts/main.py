@@ -1429,9 +1429,13 @@ def rgbd_slam(config: dict):
     # frame. Remove them here, after refinement, since refinement is the last
     # thing that could legitimately bring one back.
     #
-    # Gated on TVS: this clears what TVS itself faded. A map built without TVS
-    # has almost nothing down there to clear (1.0% vs 36.4% on C3VD), which is
-    # why the same operation cannot compact a baseline map.
+    # Gated on TVS. Note the floor population is not TVS's alone: on C3VD the
+    # baseline leaves 1.0% there and TVS's online decay by itself only 1.7%,
+    # but refinement drives 10.8% down through ordinary gradient descent and
+    # the two together reach 36.4% -- TVS fades a large set, refinement
+    # finishes them off and leaves them there. So this gate does withhold from
+    # the refinement-only arms a cleanup they would benefit from; run them with
+    # tvs_final_cleanup forced on if an apples-to-apples ablation is wanted.
     cleanup_removed = 0
     if (innovation_cfg.get("enable_tvs_pruning", False)
             and innovation_cfg.get("tvs_final_cleanup", True)):
