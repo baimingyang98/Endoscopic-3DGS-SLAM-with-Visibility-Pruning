@@ -33,7 +33,35 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-GRAY, BLUE, GREEN = "#5a5a5a", "#2b6cb0", "#2a9d3a"
+GRAY, BLUE, GREEN = "#6B6B6B", "#2E6DB4", "#1D9E75"
+
+plt.rcParams.update({
+    "font.size": 8, "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "STIXGeneral", "DejaVu Serif"],
+    "mathtext.fontset": "stix", "pdf.fonttype": 42, "ps.fonttype": 42,
+    "axes.titlesize": 9, "axes.labelsize": 8, "axes.linewidth": 0.6,
+    "xtick.labelsize": 7, "ytick.labelsize": 7, "legend.fontsize": 7,
+    "lines.antialiased": True,
+})
+
+
+def smooth(y):
+    """Savitzky-Golay: preserves peaks and edges better than a moving average.
+
+    Only the drawn line is smoothed. Every percentage in the figure is computed
+    from the raw endpoints, so the annotations match the tables exactly even
+    where the filter shifts the tail by a few hundred Gaussians.
+    """
+    w = max(7, (len(y) // 25) | 1)                  # odd window, ~4% of length
+    w = min(w, len(y) - 1 if len(y) % 2 == 0 else len(y) - 2)
+    if w < 5:
+        return y
+    try:
+        from scipy.signal import savgol_filter
+        return savgol_filter(y, w, 3, mode="interp")
+    except ImportError:                             # centred moving average
+        pad = np.pad(y, w // 2, mode="edge")
+        return np.convolve(pad, np.ones(w) / w, mode="valid")
 
 
 def load_curve(d):
@@ -60,20 +88,29 @@ def main():
     ap.add_argument("--out", default="pictures/map_growth")
     ap.add_argument("--scene", default="sigmoid_t1_a")
     ap.add_argument("--no-cleanup", action="store_true")
-    ap.add_argument("--width", type=float, default=3.4)   # IEEE single column
-    ap.add_argument("--height", type=float, default=2.7)
+    ap.add_argument("--no-smooth", action="store_true",
+                    help="Draw the raw per-frame counts as the main line.")
+    ap.add_argument("--raw", action="store_true", default=True,
+                    help="Underlay the unsmoothed counts faintly (default on).")
+    ap.add_argument("--no-raw", dest="raw", action="store_false")
+    ap.add_argument("--width", type=float, default=3.45)   # IEEE single column
+    ap.add_argument("--height", type=float, default=2.6)
     args = ap.parse_args()
 
     fig, ax = plt.subplots(figsize=(args.width, args.height))
 
-    series = [("Baseline", args.baseline, GRAY, 1.6),
-              ("TV", args.tv, BLUE, 1.4),
-              ("TVS (TV+Spatial)", args.tvs, GREEN, 1.6)]
+    series = [("Baseline", args.baseline, GRAY),
+              ("TV", args.tv, BLUE),
+              ("TVS (TV+Spatial)", args.tvs, GREEN)]
     ends = {}
-    for label, d, colour, lw in series:
+    for label, d, colour in series:
         x, y = load_curve(d)
-        ax.plot(x, y, color=colour, lw=lw, label=label, zorder=3)
-        ends[label] = (x[-1], y[-1])
+        if args.raw:
+            ax.plot(x, y, color=colour, lw=0.5, alpha=0.20, zorder=1)
+        ax.plot(x, y if args.no_smooth else smooth(y), color=colour, lw=1.7,
+                label=label, solid_capstyle="round", solid_joinstyle="round",
+                zorder=2)
+        ends[label] = (x[-1], y[-1])          # raw, so annotations match tables
 
     base_end = ends["Baseline"][1]
     tvs_x, tvs_end = ends["TVS (TV+Spatial)"]
@@ -103,8 +140,8 @@ def main():
     fig.tight_layout()
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    for ext in ("png", "pdf"):
-        fig.savefig(f"{args.out}.{ext}", dpi=300)
+    fig.savefig(f"{args.out}.png", dpi=400, bbox_inches="tight")
+    fig.savefig(f"{args.out}.pdf", bbox_inches="tight")
     print(f"wrote {args.out}.png / .pdf")
     for k, (_, v) in ends.items():
         print(f"  {k:<20} online end {v * 1000:9.0f}  "
