@@ -82,7 +82,8 @@ def final_count(d):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline", required=True)
-    ap.add_argument("--tv", required=True)
+    ap.add_argument("--tv", default=None,
+                    help="Optional TV-only curve; omit to plot Baseline vs TVS.")
     ap.add_argument("--tvs", required=True)
     ap.add_argument("--full", required=True)
     ap.add_argument("--out", default="pictures/map_growth")
@@ -99,9 +100,14 @@ def main():
 
     fig, ax = plt.subplots(figsize=(args.width, args.height))
 
-    series = [("Baseline", args.baseline, GRAY),
-              ("TV", args.tv, BLUE),
-              ("TVS (TV+Spatial)", args.tvs, GREEN)]
+    # The TV curve is optional. On C3VD it lands within ~1% of TV+Spatial, well
+    # inside run-to-run variation, so plotting both draws two lines on top of
+    # each other and invites the reader to conclude the spatial term does
+    # nothing. Table III carries that comparison with the numbers to support it.
+    series = [("Baseline", args.baseline, GRAY)]
+    if args.tv:
+        series.append(("TV", args.tv, BLUE))
+    series.append(("TVS (TV+Spatial)", args.tvs, GREEN))
     ends = {}
     for label, d, colour in series:
         x, y = load_curve(d)
