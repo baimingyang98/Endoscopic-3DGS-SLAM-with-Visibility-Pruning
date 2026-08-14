@@ -17,6 +17,7 @@ Deps: numpy, matplotlib
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 from matplotlib.patches import Rectangle, Ellipse, FancyArrowPatch
 
 # ----------------------------------------------------------------------------
@@ -65,6 +66,19 @@ def gate(tvs):
     return 1.0 / (1.0 + np.exp(-(np.log(tvs + 1e-12) - np.log(TAU_SIG)) / T))
 
 
+def halo_text(fig, lw=1.6):
+    """Knock a white outline out behind every label in the figure.
+
+    The panels put text over shaded bands and over the curves themselves, where
+    coloured type on a coloured ground loses contrast at print size. Applied to
+    all axes at the end so no individual call has to remember it.
+    """
+    for ax in fig.axes:
+        for t in ax.texts:
+            t.set_path_effects([pe.withStroke(linewidth=lw, foreground="white"),
+                                pe.Normal()])
+
+
 # ----------------------------------------------------------------------------
 # Panel (a): the soft-decay gate
 # ----------------------------------------------------------------------------
@@ -111,8 +125,10 @@ def panel_hist(ax, baseline_dir, tvs_dir, cache):
     # and a legend box lands on top of one series or the other
     # everything sits above the curves: the band's lower half is crossed by the
     # baseline's near-vertical drop, which was overprinting the caption text
-    ax.text(1.6e-3, 6, "TVS", fontsize=7, color=GREEN, ha="center")
-    ax.text(0.42, 9, "baseline", fontsize=7, color=GRAY, ha="center")
+    ax.text(1.6e-3, 6, "TVS", fontsize=7.5, color=GREEN, ha="center",
+            fontweight="bold")
+    ax.text(0.42, 9, "baseline", fontsize=7.5, color=GRAY, ha="center",
+            fontweight="bold")
     # the band caption owns the top strip; the threshold label sits mid-height
     # to its right, so the two never share a line
     ax.text(1.15e-3, 105, "removed by cleanup", fontsize=6.5, color=RED,
@@ -167,16 +183,18 @@ def panel_opacity(ax):
     # where the axes would otherwise cut most of it away
     ax.plot([n - 1], [A[-1]], marker="x", ms=8, mew=2.2, color=RED,
             zorder=6, clip_on=False)
-    ax.annotate("deleted by\nfinal cleanup", xy=(n - 1, A[-1]),
-                xytext=(-16, 30), textcoords="offset points", fontsize=6.5,
-                color=RED, ha="right", va="bottom",
+    # placed over the stretch where the curve is already flat on the floor, so
+    # the halo has nothing to erase
+    ax.annotate("deleted by\ncleanup", xy=(n - 1, A[-1]),
+                xytext=(170, 0.38), textcoords="data", fontsize=6.5,
+                color=RED, ha="center", va="bottom",
                 arrowprops=dict(arrowstyle="->", color=RED, lw=0.9,
                                 shrinkA=0, shrinkB=4))
     ax.text(n - 4, 0.93, "stream ends", fontsize=6.5, ha="right",
             color="black", rotation=90, va="top")
 
     ax.text(20, 0.90, "visible", fontsize=7, ha="center", color=GREEN)
-    ax.text(67, 0.52, "unobserved\n$\\rightarrow$ decay",
+    ax.text(75, 0.45, "unobserved\n$\\rightarrow$ decay",
             fontsize=7, ha="center", color=RED)
     ax.text(112, 0.90, "re-observed", fontsize=7, ha="center", color=GREEN)
 
@@ -268,6 +286,7 @@ def main():
     panel_hist(axes[0], args.baseline_group, args.tvs_group, args.cache)
     panel_opacity(axes[1])
     panel_mask(axes[2])
+    halo_text(fig)
     fig.tight_layout(w_pad=1.4)
 
     out_dir = os.path.dirname(os.path.abspath(__file__))
