@@ -109,11 +109,16 @@ def panel_hist(ax, baseline_dir, tvs_dir, cache):
 
     # labelled on the curves rather than in a legend: the panel is 2.2 in wide
     # and a legend box lands on top of one series or the other
-    ax.text(4.5e-3, 42, "TVS", fontsize=7, color=GREEN, ha="center")
+    # everything sits above the curves: the band's lower half is crossed by the
+    # baseline's near-vertical drop, which was overprinting the caption text
+    ax.text(1.6e-3, 6, "TVS", fontsize=7, color=GREEN, ha="center")
     ax.text(0.42, 9, "baseline", fontsize=7, color=GRAY, ha="center")
-    ax.annotate(r"$\alpha_{\mathrm{clean}}$", xy=(ALPHA_CLEAN, 70),
+    # the band caption owns the top strip; the threshold label sits mid-height
+    # to its right, so the two never share a line
+    ax.text(1.15e-3, 105, "removed by cleanup", fontsize=6.5, color=RED,
+            va="center")
+    ax.annotate(r"$\alpha_{\mathrm{clean}}$", xy=(ALPHA_CLEAN, 22),
                 xytext=(3, 0), textcoords="offset points", fontsize=7)
-    ax.text(1.15e-3, 0.075, "removed by cleanup", fontsize=6.5, color=RED)
     ax.text(0.95, 0.075, "%.0f%% vs %.0f%% below" % (ft, fb),
             fontsize=6.5, ha="right", color="black")
 
@@ -158,11 +163,16 @@ def panel_opacity(ax):
 
     # end of stream: recovery is no longer possible, so the cleanup deletes it
     ax.axvline(n - 1, color="black", ls=":", lw=0.9)
-    ax.plot([n - 1], [A[-1]], marker="x", ms=6, mew=1.6, color=RED)
+    # clip_on=False: the marker sits on the floor line at the right-hand edge,
+    # where the axes would otherwise cut most of it away
+    ax.plot([n - 1], [A[-1]], marker="x", ms=8, mew=2.2, color=RED,
+            zorder=6, clip_on=False)
     ax.annotate("deleted by\nfinal cleanup", xy=(n - 1, A[-1]),
-                xytext=(-4, 14), textcoords="offset points", fontsize=6.5,
-                color=RED, ha="right", va="bottom")
-    ax.text(n - 3, 0.93, "stream ends", fontsize=6.5, ha="right",
+                xytext=(-16, 30), textcoords="offset points", fontsize=6.5,
+                color=RED, ha="right", va="bottom",
+                arrowprops=dict(arrowstyle="->", color=RED, lw=0.9,
+                                shrinkA=0, shrinkB=4))
+    ax.text(n - 4, 0.93, "stream ends", fontsize=6.5, ha="right",
             color="black", rotation=90, va="top")
 
     ax.text(20, 0.90, "visible", fontsize=7, ha="center", color=GREEN)
