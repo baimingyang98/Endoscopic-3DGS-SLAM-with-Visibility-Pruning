@@ -35,14 +35,16 @@ import matplotlib.pyplot as plt
 
 GRAY, BLUE, GREEN = "#6B6B6B", "#2E6DB4", "#1D9E75"
 
-plt.rcParams.update({
+IEEE_STYLE = {
     "font.size": 8, "font.family": "serif",
     "font.serif": ["Times New Roman", "Times", "STIXGeneral", "DejaVu Serif"],
     "mathtext.fontset": "stix", "pdf.fonttype": 42, "ps.fonttype": 42,
     "axes.titlesize": 9, "axes.labelsize": 8, "axes.linewidth": 0.6,
     "xtick.labelsize": 7, "ytick.labelsize": 7, "legend.fontsize": 7,
     "lines.antialiased": True,
-})
+}
+# Applied in main(), not at import: make_teaser_row3.py imports the helpers
+# below, and Times New Roman has no glyph for the checkmarks its table uses.
 
 
 def smooth(y):
@@ -98,6 +100,7 @@ def main():
     ap.add_argument("--height", type=float, default=2.6)
     args = ap.parse_args()
 
+    plt.rcParams.update(IEEE_STYLE)
     fig, ax = plt.subplots(figsize=(args.width, args.height))
 
     # The TV curve is optional. On C3VD it lands within ~1% of TV+Spatial, well
